@@ -1,0 +1,49 @@
+# Numina Plan Example
+# This is an example plan configuration
+
+name = "data-analysis-workflow"
+description = "Automated data analysis workflow"
+
+[[steps]]
+name = "load_data"
+description = "Load data from source"
+step_type = "ToolCall"
+depends_on = []
+[steps.config]
+retry_count = 3
+timeout_seconds = 60
+required = true
+
+[[steps]]
+name = "clean_data"
+description = "Clean and preprocess data"
+step_type = "AgentTask"
+depends_on = ["load_data"]
+[steps.config]
+retry_count = 2
+timeout_seconds = 120
+required = true
+
+[[steps]]
+name = "analyze_data"
+description = "Perform data analysis"
+step_type = "AgentTask"
+depends_on = ["clean_data"]
+[steps.config]
+retry_count = 3
+timeout_seconds = 300
+required = true
+
+[[steps]]
+name = "generate_report"
+description = "Generate analysis report"
+step_type = "ToolCall"
+depends_on = ["analyze_data"]
+[steps.config]
+retry_count = 2
+timeout_seconds = 60
+required = true
+
+[metadata]
+created_by = "user"
+tags = ["data", "analysis", "automation"]

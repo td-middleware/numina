@@ -1,0 +1,24 @@
+# Numina Agent Example
+
+name = "data-analyst"
+description = "Specialized agent for data analysis tasks"
+model = "gpt-4o"
+role = "Data Analyst"
+
+[config]
+temperature = 0.7
+max_tokens = 4096
+timeout_seconds = 300
+retry_count = 3
+
+[[capabilities]]
+name = "data_processing"
+description = "Process and transform data"
+
+[[capabilities]]
+name = "statistical_analysis"
+description = "Perform statistical analysis"
+
+[[capabilities]]
+name = "visualization"
+description = "Create data visualizations"
