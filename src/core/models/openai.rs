@@ -4,28 +4,75 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::{ChatResponse, Message, ModelProvider, Role, Usage};
+use super::provider::{ChatResponseWithTools, StopReason, ToolCall, ToolDefinition};
 
 // ─────────────────────────────────────────────
-// OpenAI request / response types
+// OpenAI request types
 // ─────────────────────────────────────────────
 
 #[derive(Serialize)]
-struct OpenAIRequest<'a> {
-    model: &'a str,
-    messages: Vec<OpenAIMessage<'a>>,
+struct OpenAIRequest {
+    model: String,
+    messages: Vec<OpenAIMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Clone)]
+struct OpenAIMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    /// 工具调用（assistant 消息）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OpenAIToolCallOut>>,
+    /// 工具结果（tool 消息）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    /// 工具名称（tool 消息）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct OpenAIToolCallOut {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: OpenAIFunctionCall,
+}
+
+#[derive(Serialize, Clone)]
+struct OpenAIFunctionCall {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Serialize)]
-struct OpenAIMessage<'a> {
-    role: &'a str,
-    content: &'a str,
+struct OpenAITool {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: OpenAIFunctionDef,
 }
+
+#[derive(Serialize)]
+struct OpenAIFunctionDef {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+// ─────────────────────────────────────────────
+// OpenAI response types
+// ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct OpenAIResponse {
@@ -37,11 +84,27 @@ struct OpenAIResponse {
 #[derive(Deserialize)]
 struct OpenAIChoice {
     message: OpenAIChoiceMessage,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct OpenAIChoiceMessage {
-    content: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAIToolCallIn>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIToolCallIn {
+    id: String,
+    function: OpenAIFunctionCallIn,
+}
+
+#[derive(Deserialize)]
+struct OpenAIFunctionCallIn {
+    name: String,
+    arguments: String,
 }
 
 #[derive(Deserialize)]
@@ -94,7 +157,6 @@ impl OpenAIProvider {
     }
 
     pub fn with_endpoint(mut self, endpoint: String) -> Self {
-        // 去掉末尾斜杠，统一格式
         self.endpoint = endpoint.trim_end_matches('/').to_string();
         self
     }
@@ -106,6 +168,35 @@ impl OpenAIProvider {
             Role::Assistant => "assistant",
             Role::Tool => "tool",
         }
+    }
+
+    /// 将通用 Message 列表转换为 OpenAI 格式
+    fn convert_messages(messages: &[Message]) -> Vec<OpenAIMessage> {
+        messages
+            .iter()
+            .map(|m| OpenAIMessage {
+                role: Self::role_str(&m.role).to_string(),
+                content: Some(m.content.clone()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            })
+            .collect()
+    }
+
+    /// 将 ToolDefinition 列表转换为 OpenAI tools 格式
+    fn convert_tools(tools: &[ToolDefinition]) -> Vec<OpenAITool> {
+        tools
+            .iter()
+            .map(|t| OpenAITool {
+                tool_type: "function".to_string(),
+                function: OpenAIFunctionDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    parameters: t.parameters.clone(),
+                },
+            })
+            .collect()
     }
 }
 
@@ -120,20 +211,14 @@ impl ModelProvider for OpenAIProvider {
             );
         }
 
-        let oai_messages: Vec<OpenAIMessage> = messages
-            .iter()
-            .map(|m| OpenAIMessage {
-                role: Self::role_str(&m.role),
-                content: &m.content,
-            })
-            .collect();
-
         let req_body = OpenAIRequest {
-            model: &self.model,
-            messages: oai_messages,
+            model: self.model.clone(),
+            messages: Self::convert_messages(messages),
             stream: None,
             max_tokens: Some(4096),
             temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
         };
 
         let url = format!("{}/chat/completions", self.endpoint);
@@ -161,18 +246,14 @@ impl ModelProvider for OpenAIProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .and_then(|c| c.message.content)
             .unwrap_or_default();
 
         let usage = oai_resp.usage.map(|u| Usage {
             prompt_tokens: u.prompt_tokens,
             completion_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
-        }).unwrap_or(Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-        });
+        }).unwrap_or_default();
 
         Ok(ChatResponse {
             content,
@@ -188,20 +269,14 @@ impl ModelProvider for OpenAIProvider {
             );
         }
 
-        let oai_messages: Vec<OpenAIMessage> = messages
-            .iter()
-            .map(|m| OpenAIMessage {
-                role: Self::role_str(&m.role),
-                content: &m.content,
-            })
-            .collect();
-
         let req_body = OpenAIRequest {
-            model: &self.model,
-            messages: oai_messages,
+            model: self.model.clone(),
+            messages: Self::convert_messages(messages),
             stream: Some(true),
             max_tokens: Some(4096),
             temperature: Some(0.7),
+            tools: None,
+            tool_choice: None,
         };
 
         let url = format!("{}/chat/completions", self.endpoint);
@@ -231,15 +306,11 @@ impl ModelProvider for OpenAIProvider {
                 let bytes = match chunk { Ok(b) => b, Err(_) => break };
                 buf.push_str(&String::from_utf8_lossy(&bytes));
 
-                // SSE 格式：每个事件以 \n\n 或 \r\n\r\n 结尾
-                // 按行处理，兼容 \r\n 和 \n
                 loop {
-                    // 找到第一个换行符位置
                     let newline_pos = buf.find('\n');
                     match newline_pos {
                         None => break,
                         Some(pos) => {
-                            // 提取一行，去掉末尾的 \r
                             let line = buf[..pos].trim_end_matches('\r').to_string();
                             buf = buf[pos + 1..].to_string();
 
@@ -259,15 +330,15 @@ impl ModelProvider for OpenAIProvider {
                                 if !data.is_empty() {
                                     if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
                                         for choice in chunk.choices {
-                                            // 优先使用 content，其次使用 reasoning_content
-                                            let token = if !choice.delta.content.is_empty() {
-                                                choice.delta.content
-                                            } else if !choice.delta.reasoning_content.is_empty() {
-                                                choice.delta.reasoning_content
-                                            } else {
-                                                continue;
-                                            };
-                                            let _ = tx.send(token).await;
+                                            // reasoning_content 用暗灰色包裹，content 正常输出
+                                            // 格式："\x00R" 前缀表示 reasoning，"\x00C" 前缀表示 content
+                                            if !choice.delta.reasoning_content.is_empty() {
+                                                let token = format!("\x00R{}", choice.delta.reasoning_content);
+                                                let _ = tx.send(token).await;
+                                            } else if !choice.delta.content.is_empty() {
+                                                let token = format!("\x00C{}", choice.delta.content);
+                                                let _ = tx.send(token).await;
+                                            }
                                         }
                                     }
                                 }
@@ -279,6 +350,102 @@ impl ModelProvider for OpenAIProvider {
         });
 
         Ok(rx)
+    }
+
+    /// 带工具的对话（OpenAI function calling）
+    async fn chat_with_tools(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+    ) -> Result<ChatResponseWithTools> {
+        if self.api_key.is_empty() {
+            anyhow::bail!(
+                "OpenAI API key not set. Use `numina model add` or set OPENAI_API_KEY."
+            );
+        }
+
+        let oai_tools = if tools.is_empty() {
+            None
+        } else {
+            Some(Self::convert_tools(tools))
+        };
+
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!("auto"))
+        };
+
+        let req_body = OpenAIRequest {
+            model: self.model.clone(),
+            messages: Self::convert_messages(messages),
+            stream: None,
+            max_tokens: Some(4096),
+            temperature: Some(0.7),
+            tools: oai_tools,
+            tool_choice,
+        };
+
+        let url = format!("{}/chat/completions", self.endpoint);
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&req_body)
+            .send()
+            .await
+            .context("Failed to send tool-calling request to OpenAI")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("OpenAI tool-calling API error {}: {}", status, body);
+        }
+
+        let oai_resp: OpenAIResponse = resp
+            .json()
+            .await
+            .context("Failed to parse OpenAI tool-calling response")?;
+
+        let usage = oai_resp.usage.map(|u| Usage {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+        }).unwrap_or_default();
+
+        let choice = oai_resp.choices.into_iter().next();
+        let finish_reason = choice
+            .as_ref()
+            .and_then(|c| c.finish_reason.as_deref())
+            .unwrap_or("stop");
+        let stop_reason = StopReason::from_str(finish_reason);
+
+        let content = choice
+            .as_ref()
+            .and_then(|c| c.message.content.clone())
+            .unwrap_or_default();
+
+        let tool_calls = choice
+            .and_then(|c| c.message.tool_calls)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tc| {
+                let arguments = serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                ToolCall {
+                    id: tc.id,
+                    name: tc.function.name,
+                    arguments,
+                }
+            })
+            .collect();
+
+        Ok(ChatResponseWithTools {
+            content,
+            tool_calls,
+            stop_reason,
+            usage,
+        })
     }
 
     fn name(&self) -> &str {

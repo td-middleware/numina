@@ -209,6 +209,61 @@ impl ChatEngine {
         parts.join("\n")
     }
 
+    /// 构建发送给模型的消息列表，自动压缩超长上下文
+    ///
+    /// 压缩策略：
+    /// - 当历史 token 数超过 context_window * 90% 时触发压缩
+    /// - 保留最近 KEEP_RECENT_TURNS 条消息
+    /// - 把更早的消息压缩成一段文字摘要，插入到历史开头
+    fn build_messages_with_compression(
+        &self,
+        session: &mut ChatSession,
+        context_window: usize,
+    ) {
+        const KEEP_RECENT_TURNS: usize = 6; // 保留最近 6 条消息（约 3 轮对话）
+        const COMPRESS_THRESHOLD: f64 = 0.90; // 超过 90% 触发压缩
+
+        let threshold_tokens = (context_window as f64 * COMPRESS_THRESHOLD) as usize;
+
+        // 估算当前历史 token 数
+        let history_chars: usize = session.turns.iter().map(|t| t.content.len()).sum();
+        let history_tokens = history_chars / 4;
+
+        if history_tokens <= threshold_tokens || session.turns.len() <= KEEP_RECENT_TURNS {
+            return; // 不需要压缩
+        }
+
+        // 分割：旧消息 + 最近消息
+        let split_at = session.turns.len().saturating_sub(KEEP_RECENT_TURNS);
+        let old_turns = &session.turns[..split_at];
+        let recent_turns = session.turns[split_at..].to_vec();
+
+        // 生成摘要文本（简单拼接旧消息的前 200 字符，不调用 API）
+        let mut summary_parts = vec!["[Earlier conversation summary]:".to_string()];
+        for turn in old_turns {
+            let preview: String = turn.content.chars().take(200).collect();
+            let ellipsis = if turn.content.len() > 200 { "..." } else { "" };
+            summary_parts.push(format!("{}: {}{}", turn.role, preview, ellipsis));
+        }
+        let summary = summary_parts.join("\n");
+
+        // 重建 turns：摘要作为 user 消息 + assistant 确认 + 最近消息
+        let mut new_turns = vec![
+            ChatTurn {
+                role: "user".to_string(),
+                content: summary,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+            ChatTurn {
+                role: "assistant".to_string(),
+                content: "I understand the conversation history. Let me continue from where we left off.".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            },
+        ];
+        new_turns.extend(recent_turns);
+        session.turns = new_turns;
+    }
+
     /// 单次对话（非交互式）
     /// 返回 (response_text, session_id, used_tokens, context_window)
     pub async fn chat_once(
@@ -227,6 +282,12 @@ impl ChatEngine {
 
         // 追加用户消息
         session.push("user", user_message);
+
+        // 获取 context window 大小
+        let context_window = self.get_context_window(model_override);
+
+        // 自动压缩超长上下文（超过 90% 时触发）
+        self.build_messages_with_compression(&mut session, context_window);
 
         // 构建完整消息列表（system + history）
         let system_prompt = self.build_system_prompt();
@@ -251,10 +312,7 @@ impl ChatEngine {
             sent_tokens + reply.len() / 4
         };
 
-        // 获取 context window 大小
-        let context_window = self.get_context_window(model_override);
-
-        // 追加 assistant 回复并持久化
+        // 追加 assistant 回复并持久化（压缩后的 session）
         session.push("assistant", &reply);
         save_session(&session)?;
 
@@ -278,6 +336,12 @@ impl ChatEngine {
 
         session.push("user", user_message);
 
+        // 获取 context window 大小
+        let context_window = self.get_context_window(model_override);
+
+        // 自动压缩超长上下文（超过 90% 时触发）
+        self.build_messages_with_compression(&mut session, context_window);
+
         let system_prompt = self.build_system_prompt();
         let mut messages = vec![Message {
             role: Role::System,
@@ -289,14 +353,11 @@ impl ChatEngine {
         let sent_chars: usize = messages.iter().map(|m| m.content.len()).sum();
         let sent_tokens = sent_chars / 4;
 
-        // 获取 context window 大小
-        let context_window = self.get_context_window(model_override);
-
         let rx = provider.chat_stream(&messages).await?;
         let sid = session.id.clone();
 
         // 注意：流式模式下 session 的 assistant turn 需要调用方在收完后追加
-        // 这里先保存（不含 assistant 回复），调用方负责调用 append_assistant_turn
+        // 这里先保存压缩后的 session（不含 assistant 回复），调用方负责调用 append_assistant_turn
         save_session(&session)?;
 
         Ok((rx, sid, sent_tokens, context_window))

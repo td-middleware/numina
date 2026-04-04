@@ -3,7 +3,11 @@ pub mod openai;
 pub mod anthropic;
 pub mod local;
 
-pub use provider::{ModelProvider, Message, Role};
+pub use provider::{
+    ModelProvider, Message, Role,
+    ToolDefinition, ToolCall, ToolResult as ProviderToolResult,
+    ChatResponseWithTools, StopReason,
+};
 pub use openai::OpenAIProvider;
 pub use anthropic::AnthropicProvider;
 pub use local::LocalProvider;
@@ -48,7 +52,7 @@ pub struct ChatResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,

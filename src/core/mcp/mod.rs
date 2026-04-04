@@ -1,7 +1,7 @@
 pub mod client;
 pub mod server;
 
-pub use client::McpClient;
+pub use client::{McpClient, McpToolInfo, McpCallResult, McpContent, fetch_tools_with_timeout};
 pub use server::McpServer;
 
 use serde::{Deserialize, Serialize};

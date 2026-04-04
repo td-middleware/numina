@@ -1,32 +1,26 @@
-/// ReAct Agent — Reason + Act 循环引擎
+/// ReAct Agent — Reason + Act 循环引擎（Function Calling 版）
 ///
 /// 工作流程：
 /// 1. 用户给出任务目标
-/// 2. 构建包含工具描述的 system prompt
-/// 3. 调用模型，解析响应中的 <tool_call> 块
-/// 4. 执行工具，把结果作为 <tool_result> 追加到对话
-/// 5. 重复 3-4，直到模型输出 <final_answer> 或达到最大步数
+/// 2. 将工具列表以 OpenAI function calling 格式发送给模型
+/// 3. 模型返回 tool_calls 或文本回复
+/// 4. 执行工具，把结果作为 tool 消息追加到对话
+/// 5. 重复 3-4，直到模型不再调用工具（stop_reason = Stop）或达到最大步数
 ///
-/// 工具调用格式（模型输出）：
-/// ```
-/// <tool_call>
-/// {"tool": "read_file", "params": {"path": "src/main.rs"}}
-/// </tool_call>
-/// ```
-///
-/// 最终答案格式：
-/// ```
-/// <final_answer>
-/// 这里是最终结论...
-/// </final_answer>
-/// ```
+/// 相比旧版 XML 标签解析，function calling 更可靠：
+/// - 不依赖模型严格遵守 XML 格式
+/// - 支持并行工具调用
+/// - 参数类型安全（JSON Schema 约束）
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 
 use crate::config::{NuminaConfig, ModelsConfig};
-use crate::core::models::{Message, Role};
+use crate::core::models::{
+    AnthropicProvider, LocalProvider, Message, ModelProvider, OpenAIProvider, Role,
+    ToolDefinition, StopReason,
+};
 use crate::core::skills::SkillManager;
 use crate::core::tools::builtin::default_registry;
 use crate::core::tools::ToolRegistry;
@@ -57,94 +51,139 @@ pub struct AgentRunResult {
 }
 
 // ─────────────────────────────────────────────
-// 工具调用解析
+// 工具 schema 构建
 // ─────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct ToolCallPayload {
-    tool: String,
-    #[serde(default)]
-    params: serde_json::Value,
+/// 将 ToolRegistry 中的工具转换为 OpenAI function calling 格式的 ToolDefinition
+fn build_tool_definitions(registry: &ToolRegistry) -> Vec<ToolDefinition> {
+    registry
+        .list_tools()
+        .into_iter()
+        .filter_map(|name| {
+            let executor = registry.get(&name)?;
+            // 从 description 中提取参数信息，构建基础 JSON Schema
+            // 实际生产中应该让每个工具提供自己的 schema
+            let schema = build_schema_from_description(&name, executor.description());
+            Some(ToolDefinition {
+                name,
+                description: executor.description().to_string(),
+                parameters: schema,
+            })
+        })
+        .collect()
 }
 
-fn extract_tool_call(text: &str) -> Option<ToolCallPayload> {
-    let start = text.find("<tool_call>")?;
-    let end = text.find("</tool_call>")?;
-    let json_str = text[start + "<tool_call>".len()..end].trim();
-    serde_json::from_str(json_str).ok()
-}
-
-fn extract_final_answer(text: &str) -> Option<String> {
-    let start = text.find("<final_answer>")?;
-    let end = text.find("</final_answer>")?;
-    Some(text[start + "<final_answer>".len()..end].trim().to_string())
-}
-
-fn extract_thought(text: &str) -> String {
-    // 提取 <tool_call> 或 <final_answer> 之前的文本作为 thought
-    let end = text
-        .find("<tool_call>")
-        .or_else(|| text.find("<final_answer>"))
-        .unwrap_or(text.len());
-    text[..end].trim().to_string()
-}
-
-// ─────────────────────────────────────────────
-// System prompt 构建
-// ─────────────────────────────────────────────
-
-fn build_act_system_prompt(registry: &ToolRegistry, skill_manager: &SkillManager) -> String {
-    let mut parts = vec![
-        "You are Numina, an autonomous AI coding agent. You can reason and take actions to complete tasks.".to_string(),
-        "".to_string(),
-        "## How to use tools".to_string(),
-        "When you need to use a tool, output EXACTLY this format:".to_string(),
-        "<tool_call>".to_string(),
-        "{\"tool\": \"<tool_name>\", \"params\": {<parameters>}}".to_string(),
-        "</tool_call>".to_string(),
-        "".to_string(),
-        "When you have completed the task and have a final answer, output EXACTLY:".to_string(),
-        "<final_answer>".to_string(),
-        "Your complete answer here...".to_string(),
-        "</final_answer>".to_string(),
-        "".to_string(),
-        "Think step by step. Before each tool call, briefly explain your reasoning.".to_string(),
-        "".to_string(),
-        "## Available Tools".to_string(),
-    ];
-
-    for tool_name in registry.list_tools() {
-        if let Some(executor) = registry.get(&tool_name) {
-            parts.push(format!("### {}", tool_name));
-            parts.push(executor.description().to_string());
-            parts.push("".to_string());
-        }
+/// 根据工具名称生成对应的 JSON Schema
+fn build_schema_from_description(name: &str, _description: &str) -> serde_json::Value {
+    match name {
+        "read_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to read"
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read (default: 500)"
+                }
+            },
+            "required": ["path"]
+        }),
+        "write_file" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to write"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The content to write to the file"
+                }
+            },
+            "required": ["path", "content"]
+        }),
+        "list_dir" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The directory path to list"
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Whether to list recursively (default: false)"
+                }
+            },
+            "required": ["path"]
+        }),
+        "shell" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute"
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the command"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default: 30)"
+                }
+            },
+            "required": ["command"]
+        }),
+        "search_code" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The regex pattern to search for"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory to search in (default: current directory)"
+                },
+                "file_pattern": {
+                    "type": "string",
+                    "description": "File glob pattern to filter (e.g., '*.rs')"
+                }
+            },
+            "required": ["pattern"]
+        }),
+        "find_files" => serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match files (e.g., '**/*.rs')"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory to search in (default: current directory)"
+                }
+            },
+            "required": ["pattern"]
+        }),
+        _ => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        }),
     }
-
-    // 注入 skills
-    let skills = skill_manager.skills();
-    if !skills.is_empty() {
-        parts.push("## Skills".to_string());
-        for skill in skills {
-            parts.push(format!("### {}", skill.name));
-            parts.push(skill.description.clone());
-        }
-    }
-
-    parts.join("\n")
 }
 
 // ─────────────────────────────────────────────
-// Provider factory（复用 chat.rs 的逻辑）
+// Provider factory
 // ─────────────────────────────────────────────
-
-use crate::core::models::{AnthropicProvider, LocalProvider, ModelProvider, OpenAIProvider};
 
 fn build_provider(
     config: &NuminaConfig,
     model_override: Option<&str>,
 ) -> Result<Box<dyn ModelProvider>> {
-    // 从独立的 models.json 读取模型列表
     let models_cfg = ModelsConfig::load().unwrap_or_default();
 
     let model_name = model_override
@@ -184,6 +223,49 @@ fn build_provider(
     };
 
     Ok(provider)
+}
+
+// ─────────────────────────────────────────────
+// System prompt
+// ─────────────────────────────────────────────
+
+fn build_system_prompt(skill_manager: &SkillManager) -> String {
+    let mut parts = vec![
+        "You are Numina, an autonomous AI coding agent. You can reason and take actions to complete tasks.".to_string(),
+        "Use the available tools to accomplish the user's task. Think step by step.".to_string(),
+        "When you have gathered enough information and completed the task, provide a clear final answer.".to_string(),
+    ];
+
+    let skills = skill_manager.skills();
+    if !skills.is_empty() {
+        parts.push("\n## Skills".to_string());
+        for skill in skills {
+            parts.push(format!("### {}", skill.name));
+            parts.push(skill.description.clone());
+        }
+    }
+
+    parts.join("\n")
+}
+
+// ─────────────────────────────────────────────
+// 多轮对话消息构建（支持 tool 消息）
+// ─────────────────────────────────────────────
+
+/// 将工具调用结果追加为 tool 角色消息
+/// OpenAI 格式：role=tool, tool_call_id=..., content=...
+/// 由于 Message 只有 content 字段，我们把 tool_call_id 编码进 content
+/// 实际上 chat_with_tools 内部会正确处理
+fn make_tool_result_message(tool_call_id: &str, tool_name: &str, result: &str) -> Message {
+    // 编码为 JSON 格式，让 provider 能正确解析
+    Message {
+        role: Role::Tool,
+        content: serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "name": tool_name,
+            "content": result
+        }).to_string(),
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -228,7 +310,7 @@ impl ActAgent {
         self
     }
 
-    /// 运行 ReAct 循环
+    /// 运行 ReAct 循环（function calling 版）
     pub async fn run(
         &self,
         task: &str,
@@ -236,7 +318,8 @@ impl ActAgent {
         cwd: Option<&str>,
     ) -> Result<AgentRunResult> {
         let provider = build_provider(&self.config, model_override)?;
-        let system_prompt = build_act_system_prompt(&self.registry, &self.skill_manager);
+        let system_prompt = build_system_prompt(&self.skill_manager);
+        let tool_defs = build_tool_definitions(&self.registry);
 
         let mut messages: Vec<Message> = vec![
             Message {
@@ -255,8 +338,12 @@ impl ActAgent {
 
         if self.verbose {
             println!("🤖 Numina Agent — task: {}", task);
-            println!("   model: {}  tools: {}  max_steps: {}\n",
-                provider.name(), self.registry.list_tools().len(), self.max_steps);
+            println!(
+                "   model: {}  tools: {}  max_steps: {}\n",
+                provider.name(),
+                tool_defs.len(),
+                self.max_steps
+            );
         }
 
         for step_num in 1..=self.max_steps {
@@ -265,116 +352,145 @@ impl ActAgent {
                 std::io::stdout().flush().ok();
             }
 
-            // 调用模型
-            let response = provider.chat(&messages).await?;
-            let text = response.content.trim().to_string();
+            // 调用模型（带工具定义）
+            let response = provider.chat_with_tools(&messages, &tool_defs).await?;
 
             if self.verbose {
                 println!("done");
             }
 
-            let thought = extract_thought(&text);
+            let thought = response.content.clone();
 
-            // 检查是否有最终答案
-            if let Some(answer) = extract_final_answer(&text) {
-                if self.verbose {
-                    println!("\n✅ Final Answer:\n{}", answer);
-                }
-                steps.push(AgentStep {
-                    step: step_num,
-                    thought: thought.clone(),
-                    tool_name: None,
-                    tool_params: None,
-                    tool_result: None,
-                    is_final: true,
-                    final_answer: Some(answer.clone()),
-                });
-                final_answer = answer;
-                success = true;
-                break;
-            }
-
-            // 检查是否有工具调用
-            if let Some(tool_call) = extract_tool_call(&text) {
-                if self.verbose {
-                    println!("   🔧 Tool: {}  params: {}",
-                        tool_call.tool,
-                        serde_json::to_string(&tool_call.params).unwrap_or_default()
-                    );
-                }
-
-                // 注入 cwd 到 shell 工具
-                let mut params = tool_call.params.clone();
-                if tool_call.tool == "shell" && cwd.is_some() {
-                    if params.get("cwd").is_none() {
-                        params["cwd"] = serde_json::Value::String(cwd.unwrap().to_string());
-                    }
-                }
-
-                // 执行工具
-                let tool_result = self.registry.execute(&tool_call.tool, params).await;
-
-                let result_str = match &tool_result {
-                    Ok(r) => {
-                        if r.success {
-                            serde_json::to_string_pretty(&r.data).unwrap_or_default()
+            match response.stop_reason {
+                StopReason::ToolCalls if !response.tool_calls.is_empty() => {
+                    // 模型请求调用工具
+                    // 先把 assistant 消息（含 tool_calls）追加到对话
+                    // 注意：这里我们把 tool_calls 信息编码进 content，
+                    // 让 provider 在下次调用时能正确重建消息历史
+                    let tool_calls_json = serde_json::to_string(&response.tool_calls)
+                        .unwrap_or_default();
+                    messages.push(Message {
+                        role: Role::Assistant,
+                        content: if thought.is_empty() {
+                            format!("__tool_calls__:{}", tool_calls_json)
                         } else {
-                            format!("Error: {}", r.error.as_deref().unwrap_or("unknown"))
+                            format!("{}\n__tool_calls__:{}", thought, tool_calls_json)
+                        },
+                    });
+
+                    // 执行所有工具调用（顺序执行，未来可并行）
+                    for tool_call in &response.tool_calls {
+                        if self.verbose {
+                            println!(
+                                "   🔧 Tool: {}  params: {}",
+                                tool_call.name,
+                                serde_json::to_string(&tool_call.arguments).unwrap_or_default()
+                            );
                         }
+
+                        // 注入 cwd 到 shell 工具
+                        let mut params = tool_call.arguments.clone();
+                        if tool_call.name == "shell" {
+                            if let Some(cwd_val) = cwd {
+                                if params.get("cwd").is_none() {
+                                    params["cwd"] = serde_json::Value::String(cwd_val.to_string());
+                                }
+                            }
+                        }
+
+                        // 执行工具
+                        let tool_result = self.registry.execute(&tool_call.name, params).await;
+                        let result_str = match &tool_result {
+                            Ok(r) => {
+                                if r.success {
+                                    // 提取 content 字段（如果有），否则序列化整个 data
+                                    if let Some(content) = r.data.get("content").and_then(|v| v.as_str()) {
+                                        content.to_string()
+                                    } else {
+                                        serde_json::to_string_pretty(&r.data).unwrap_or_default()
+                                    }
+                                } else {
+                                    format!("Error: {}", r.error.as_deref().unwrap_or("unknown"))
+                                }
+                            }
+                            Err(e) => format!("Tool execution failed: {}", e),
+                        };
+
+                        if self.verbose {
+                            let preview: String = result_str.chars().take(300).collect();
+                            let suffix = if result_str.len() > 300 { "…" } else { "" };
+                            println!("   📋 Result: {}{}", preview, suffix);
+                        }
+
+                        steps.push(AgentStep {
+                            step: step_num,
+                            thought: thought.clone(),
+                            tool_name: Some(tool_call.name.clone()),
+                            tool_params: Some(tool_call.arguments.clone()),
+                            tool_result: Some(result_str.clone()),
+                            is_final: false,
+                            final_answer: None,
+                        });
+
+                        // 追加工具结果消息
+                        messages.push(make_tool_result_message(
+                            &tool_call.id,
+                            &tool_call.name,
+                            &result_str,
+                        ));
                     }
-                    Err(e) => format!("Tool execution failed: {}", e),
-                };
-
-                if self.verbose {
-                    let preview: String = result_str.chars().take(200).collect();
-                    let suffix = if result_str.len() > 200 { "…" } else { "" };
-                    println!("   📋 Result: {}{}", preview, suffix);
                 }
 
-                steps.push(AgentStep {
-                    step: step_num,
-                    thought: thought.clone(),
-                    tool_name: Some(tool_call.tool.clone()),
-                    tool_params: Some(tool_call.params),
-                    tool_result: Some(result_str.clone()),
-                    is_final: false,
-                    final_answer: None,
-                });
+                StopReason::Stop | StopReason::Other(_) => {
+                    // 模型给出了最终回复
+                    let answer = if thought.is_empty() {
+                        "Task completed.".to_string()
+                    } else {
+                        thought.clone()
+                    };
 
-                // 把 assistant 回复和工具结果追加到对话
-                messages.push(Message {
-                    role: Role::Assistant,
-                    content: text.clone(),
-                });
-                messages.push(Message {
-                    role: Role::User,
-                    content: format!(
-                        "<tool_result>\ntool: {}\nresult: {}\n</tool_result>",
-                        tool_call.tool, result_str
-                    ),
-                });
-            } else {
-                // 模型没有调用工具也没有给出最终答案，把回复当作最终答案
-                if self.verbose {
-                    println!("\n💬 Response:\n{}", text);
+                    if self.verbose {
+                        println!("\n✅ Final Answer:\n{}", answer);
+                    }
+
+                    steps.push(AgentStep {
+                        step: step_num,
+                        thought: thought.clone(),
+                        tool_name: None,
+                        tool_params: None,
+                        tool_result: None,
+                        is_final: true,
+                        final_answer: Some(answer.clone()),
+                    });
+
+                    final_answer = answer;
+                    success = true;
+                    break;
                 }
-                steps.push(AgentStep {
-                    step: step_num,
-                    thought: thought.clone(),
-                    tool_name: None,
-                    tool_params: None,
-                    tool_result: None,
-                    is_final: true,
-                    final_answer: Some(text.clone()),
-                });
-                final_answer = text;
-                success = true;
-                break;
+
+                StopReason::Length => {
+                    // 达到 max_tokens，把当前内容作为最终答案
+                    if self.verbose {
+                        println!("\n⚠️  Response truncated (max_tokens reached).");
+                    }
+                    final_answer = thought;
+                    success = false;
+                    break;
+                }
+
+                _ => {
+                    // tool_calls 为空但 stop_reason 是 ToolCalls（异常情况）
+                    final_answer = thought;
+                    success = true;
+                    break;
+                }
             }
         }
 
-        if !success && self.verbose {
-            println!("\n⚠️  Reached max steps ({}) without final answer.", self.max_steps);
+        if !success && final_answer.is_empty() {
+            if self.verbose {
+                println!("\n⚠️  Reached max steps ({}) without final answer.", self.max_steps);
+            }
             final_answer = "Agent reached maximum steps without completing the task.".to_string();
         }
 

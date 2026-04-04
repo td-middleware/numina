@@ -1,14 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::borrow::Cow;
 use std::io::Write;
-
-use crossterm::{
-    cursor,
-    event::{self, Event, KeyCode, KeyModifiers},
-    execute,
-    style::{Color, Print, ResetColor, SetForegroundColor},
-    terminal::{self, ClearType},
-};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -21,7 +14,7 @@ use crate::config::{McpFileConfig, McpServerEntry, ModelEntry, ModelsConfig};
 use crate::core::chat::{ChatEngine, ChatSession};
 
 // ─────────────────────────────────────────────
-// 斜杠命令补全器
+// 补全器：支持 / 斜杠命令 + @ 文件路径（含隐藏文件）
 // ─────────────────────────────────────────────
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
@@ -36,11 +29,99 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit",     "退出 Numina"),
 ];
 
-struct SlashCompleter;
+// 补全列表背景色（深蓝灰，区别于聊天背景）
+const COMPLETION_BG: &str = "\x1b[48;5;238m";
+const COMPLETION_FG: &str = "\x1b[38;5;255m";
+const COMPLETION_DIR_FG: &str = "\x1b[38;5;117m"; // 目录用蓝色
 
-impl Helper for SlashCompleter {}
+struct ChatCompleter;
 
-impl Completer for SlashCompleter {
+impl ChatCompleter {
+    fn new() -> Self { Self }
+
+    /// 自定义文件路径补全（支持 ~ 展开、隐藏文件）
+    fn complete_path(path_input: &str) -> Vec<Pair> {
+        use std::path::Path;
+
+        // 展开 ~ 为 home 目录
+        let expanded = if path_input.starts_with("~/") || path_input == "~" {
+            if let Some(home) = dirs::home_dir() {
+                let rest = &path_input[1..];
+                format!("{}{}", home.display(), rest)
+            } else {
+                path_input.to_string()
+            }
+        } else {
+            path_input.to_string()
+        };
+
+        // 分离目录部分和文件名前缀
+        let (dir_path, file_prefix, display_prefix) = if expanded.ends_with('/') {
+            // 输入以 / 结尾：列出该目录内容
+            (expanded.clone(), String::new(), path_input.to_string())
+        } else {
+            let p = Path::new(&expanded);
+            let parent = p.parent().map(|d| {
+                let s = d.to_string_lossy().to_string();
+                if s.is_empty() { ".".to_string() } else { s }
+            }).unwrap_or_else(|| ".".to_string());
+            let fname = p.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            // display_prefix：用于构造 replacement 时还原 ~ 前缀
+            let disp = if path_input.starts_with("~/") || path_input == "~" {
+                let home_str = dirs::home_dir().map(|h| h.to_string_lossy().to_string()).unwrap_or_default();
+                let parent_disp = parent.replacen(&home_str, "~", 1);
+                if parent_disp == "~" { "~/".to_string() } else { format!("{}/", parent_disp) }
+            } else if parent == "." {
+                String::new()
+            } else {
+                format!("{}/", parent)
+            };
+            (parent, fname, disp)
+        };
+
+        let dir = Path::new(&dir_path);
+        let entries = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(_) => return vec![],
+        };
+
+        let mut pairs: Vec<Pair> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let name_str = name.to_string_lossy();
+                // 匹配前缀（大小写敏感）
+                name_str.starts_with(file_prefix.as_str())
+            })
+            .map(|e| {
+                let name = e.file_name();
+                let name_str = name.to_string_lossy().to_string();
+                let is_dir = e.path().is_dir();
+                let suffix = if is_dir { "/" } else { "" };
+                // replacement：@后面的完整路径
+                let replacement = format!("{}{}{}", display_prefix, name_str, suffix);
+                // display：纯文本（highlight_candidate 会加颜色）
+                let display = format!("{}{}", name_str, suffix);
+                Pair { display, replacement }
+            })
+            .collect();
+
+        // 排序：目录优先，然后按名称
+        pairs.sort_by(|a, b| {
+            let a_dir = a.replacement.ends_with('/');
+            let b_dir = b.replacement.ends_with('/');
+            b_dir.cmp(&a_dir).then(a.replacement.cmp(&b.replacement))
+        });
+
+        pairs
+    }
+}
+
+impl Helper for ChatCompleter {}
+
+impl Completer for ChatCompleter {
     type Candidate = Pair;
 
     fn complete(
@@ -49,42 +130,277 @@ impl Completer for SlashCompleter {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
-        // 只在行首输入 / 时触发补全
         let word = &line[..pos];
-        if !word.starts_with('/') {
-            return Ok((pos, vec![]));
+
+        // @ 文件路径补全：找到最后一个 @ 的位置
+        if let Some(at_pos) = word.rfind('@') {
+            let path_part = &word[at_pos + 1..];
+            let candidates = Self::complete_path(path_part);
+            if !candidates.is_empty() {
+                // 在输入行下方打印竖向列表（写到 stderr，不干扰 readline）
+                eprint!("\r\n{}\x1b[38;5;244m{}\x1b[0m\r\n",
+                    "\x1b[48;5;238m\x1b[38;5;255m",
+                    "─".repeat(40));
+                for c in &candidates {
+                    if c.display.ends_with('/') {
+                        eprintln!("\x1b[48;5;238m\x1b[38;5;117m  {}\x1b[0m", c.display);
+                    } else {
+                        eprintln!("\x1b[48;5;238m\x1b[38;5;255m  {}\x1b[0m", c.display);
+                    }
+                }
+                eprint!("\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
+                    "─".repeat(40));
+                // 移回光标到输入行
+                let lines_printed = candidates.len() + 2;
+                eprint!("\x1b[{}A", lines_printed);
+            }
+            return Ok((at_pos + 1, candidates));
         }
 
-        let matches: Vec<Pair> = SLASH_COMMANDS
-            .iter()
-            .filter(|(cmd, _)| cmd.starts_with(word))
-            .map(|(cmd, desc)| Pair {
-                display: format!("{:<12} {}", cmd, desc),
-                replacement: cmd.to_string(),
-            })
-            .collect();
+        // / 斜杠命令补全：只在行首
+        if word.starts_with('/') {
+            let matches: Vec<Pair> = SLASH_COMMANDS
+                .iter()
+                .filter(|(cmd, _)| cmd.starts_with(word))
+                .map(|(cmd, desc)| Pair {
+                    // display：纯文本，highlight_candidate 会加颜色
+                    display: format!("{:<14} {}", cmd, desc),
+                    replacement: cmd.to_string(),
+                })
+                .collect();
+            if !matches.is_empty() {
+                eprint!("\r\n\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
+                    "─".repeat(40));
+                for m in &matches {
+                    let parts: Vec<&str> = m.display.splitn(2, ' ').collect();
+                    if parts.len() == 2 {
+                        eprintln!("\x1b[48;5;238m  \x1b[97m\x1b[1m{:<14}\x1b[0m\x1b[48;5;238m\x1b[38;5;244m {}\x1b[0m",
+                            parts[0].trim(), parts[1].trim());
+                    } else {
+                        eprintln!("\x1b[48;5;238m\x1b[97m  {}\x1b[0m", m.display);
+                    }
+                }
+                eprint!("\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
+                    "─".repeat(40));
+                let lines_printed = matches.len() + 2;
+                eprint!("\x1b[{}A", lines_printed);
+            }
+            return Ok((0, matches));
+        }
 
-        Ok((0, matches))
+        Ok((pos, vec![]))
     }
 }
 
-impl Hinter for SlashCompleter {
+impl Hinter for ChatCompleter {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
         if pos < line.len() || !line.starts_with('/') {
             return None;
         }
-        // 找到第一个匹配的命令，给出灰色提示后缀
         SLASH_COMMANDS
             .iter()
             .find(|(cmd, _)| cmd.starts_with(line) && *cmd != line)
-            .map(|(cmd, _)| cmd[line.len()..].to_string())
+            .map(|(cmd, _)| {
+                // 灰色提示后缀
+                format!("\x1b[38;5;244m{}\x1b[0m", &cmd[line.len()..])
+            })
     }
 }
 
-impl Highlighter for SlashCompleter {}
-impl Validator for SlashCompleter {}
+impl Highlighter for ChatCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Borrowed(hint)
+    }
+
+    /// 给补全候选项加背景色（rustyline List 模式下通过此方法渲染颜色）
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        _completion: rustyline::CompletionType,
+    ) -> Cow<'c, str> {
+        // candidate 是 display 字段（纯文本），在这里加颜色
+        if candidate.ends_with('/') {
+            // 目录：蓝色 + 背景
+            Cow::Owned(format!(
+                "{}{}  {}{}",
+                COMPLETION_BG, COMPLETION_DIR_FG, candidate, "\x1b[0m"
+            ))
+        } else if candidate.starts_with('/') {
+            // 斜杠命令：白色命令 + 灰色描述
+            let parts: Vec<&str> = candidate.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                Cow::Owned(format!(
+                    "{}{}  {}{:<14}{}  {}{}{}\x1b[0m",
+                    COMPLETION_BG, COMPLETION_FG,
+                    BOLD, parts[0].trim(), RESET,
+                    COMPLETION_BG, "\x1b[38;5;244m", parts[1].trim()
+                ))
+            } else {
+                Cow::Owned(format!("{}{}  {}\x1b[0m", COMPLETION_BG, COMPLETION_FG, candidate))
+            }
+        } else {
+            // 普通文件：白色 + 背景
+            Cow::Owned(format!(
+                "{}{}  {}{}",
+                COMPLETION_BG, COMPLETION_FG, candidate, "\x1b[0m"
+            ))
+        }
+    }
+
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Borrowed(line)
+    }
+}
+
+impl Validator for ChatCompleter {}
+
+// ─────────────────────────────────────────────
+// @ 文件注入：解析消息中的 @path，替换为文件内容
+// ─────────────────────────────────────────────
+
+/// 解析消息中所有 @path 引用，将文件/文件夹内容注入到消息末尾
+/// 返回 (处理后的消息, 注入的文件数量)
+fn expand_at_references(input: &str) -> (String, usize) {
+    use std::path::Path;
+
+    // 找出所有 @token（以空格或行首分隔）
+    let mut paths: Vec<String> = Vec::new();
+    for token in input.split_whitespace() {
+        if let Some(path_str) = token.strip_prefix('@') {
+            if !path_str.is_empty() {
+                paths.push(path_str.to_string());
+            }
+        }
+    }
+
+    if paths.is_empty() {
+        return (input.to_string(), 0);
+    }
+
+    let mut injected = String::new();
+    let mut count = 0usize;
+
+    for path_str in &paths {
+        let path = Path::new(path_str);
+        if path.is_file() {
+            match std::fs::read_to_string(path) {
+                Ok(content) => {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let lang = ext_to_lang(ext);
+                    injected.push_str(&format!(
+                        "\n\n--- File: {} ---\n```{}\n{}\n```",
+                        path_str, lang, content.trim_end()
+                    ));
+                    count += 1;
+                }
+                Err(e) => {
+                    injected.push_str(&format!("\n\n--- File: {} (read error: {}) ---", path_str, e));
+                }
+            }
+        } else if path.is_dir() {
+            // 文件夹：列出目录树（最多 2 层，最多 50 个文件）
+            let listing = list_dir_tree(path, 2, 50);
+            injected.push_str(&format!(
+                "\n\n--- Directory: {} ---\n```\n{}\n```",
+                path_str, listing
+            ));
+            count += 1;
+        } else {
+            injected.push_str(&format!("\n\n--- @{}: not found ---", path_str));
+        }
+    }
+
+    if injected.is_empty() {
+        (input.to_string(), 0)
+    } else {
+        (format!("{}{}", input, injected), count)
+    }
+}
+
+/// 文件扩展名 → 代码块语言标识
+fn ext_to_lang(ext: &str) -> &str {
+    match ext {
+        "rs" => "rust",
+        "go" => "go",
+        "py" => "python",
+        "js" | "mjs" => "javascript",
+        "ts" => "typescript",
+        "json" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" => "markdown",
+        "sh" | "bash" => "bash",
+        "c" => "c",
+        "cpp" | "cc" | "cxx" => "cpp",
+        "java" => "java",
+        "html" => "html",
+        "css" => "css",
+        "sql" => "sql",
+        "xml" => "xml",
+        _ => "",
+    }
+}
+
+/// 递归列出目录树，限制深度和文件数
+fn list_dir_tree(dir: &std::path::Path, max_depth: usize, max_files: usize) -> String {
+    let mut lines = Vec::new();
+    let mut count = 0usize;
+    list_dir_recursive(dir, "", max_depth, 0, &mut lines, &mut count, max_files);
+    lines.join("\n")
+}
+
+fn list_dir_recursive(
+    dir: &std::path::Path,
+    prefix: &str,
+    max_depth: usize,
+    depth: usize,
+    lines: &mut Vec<String>,
+    count: &mut usize,
+    max_files: usize,
+) {
+    if depth > max_depth || *count >= max_files {
+        return;
+    }
+    let mut entries: Vec<_> = match std::fs::read_dir(dir) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+    // 排序：目录优先，然后按名称
+    entries.sort_by(|a, b| {
+        let a_is_dir = a.path().is_dir();
+        let b_is_dir = b.path().is_dir();
+        b_is_dir.cmp(&a_is_dir).then(a.file_name().cmp(&b.file_name()))
+    });
+    // 过滤隐藏文件和常见忽略目录
+    let entries: Vec<_> = entries.into_iter().filter(|e| {
+        let name = e.file_name();
+        let name_str = name.to_string_lossy();
+        !name_str.starts_with('.') && name_str != "target" && name_str != "node_modules"
+    }).collect();
+
+    let total = entries.len();
+    for (i, entry) in entries.iter().enumerate() {
+        if *count >= max_files {
+            lines.push(format!("{}  ... (truncated)", prefix));
+            break;
+        }
+        let is_last = i == total - 1;
+        let connector = if is_last { "└── " } else { "├── " };
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let path = entry.path();
+        if path.is_dir() {
+            lines.push(format!("{}{}{}/", prefix, connector, name_str));
+            let new_prefix = format!("{}{}  ", prefix, if is_last { " " } else { "│" });
+            list_dir_recursive(&path, &new_prefix, max_depth, depth + 1, lines, count, max_files);
+        } else {
+            lines.push(format!("{}{}{}", prefix, connector, name_str));
+            *count += 1;
+        }
+    }
+}
 
 // ─────────────────────────────────────────────
 // CLI 参数定义
@@ -138,6 +454,9 @@ const BRIGHT_WHITE: &str = "\x1b[97m";
 const BLUE: &str = "\x1b[34m";
 const MAGENTA: &str = "\x1b[35m";
 const GRAY: &str = "\x1b[90m";
+// 代码块背景色（深灰背景 + 浅灰前景，类似 Claude Code 风格）
+const CODE_BG: &str = "\x1b[48;5;236m"; // 深灰背景
+const CODE_FG: &str = "\x1b[38;5;252m"; // 浅灰前景
 
 // ─────────────────────────────────────────────
 // 入口
@@ -172,9 +491,42 @@ pub async fn execute(args: &ChatArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 交互式模式
-    print_welcome(&model_name, skill_count, args.session.as_deref(), true);
-    run_interactive(&engine, args).await
+    // 交互式模式：自动恢复上次 session（除非用户指定了 --session 或 --new）
+    let restored_session = if args.session.is_none() {
+        load_last_session_id()
+    } else {
+        None
+    };
+
+    // 构造带恢复 session 的 args（借用 restored_session）
+    let effective_session = args.session.clone().or(restored_session.clone());
+
+    print_welcome(&model_name, skill_count, effective_session.as_deref(), true);
+
+    if let Some(ref sid) = restored_session {
+        println!("  {}↩  Resumed session {}{}{}", GRAY, BOLD, &sid[..8.min(sid.len())], RESET);
+        println!("  {}    Use /new to start a fresh conversation.{}", DIM, RESET);
+        println!();
+
+        // 显示已恢复 session 的上下文使用情况
+        if let Ok(session) = ChatEngine::get_session(sid) {
+            let used_chars: usize = session.turns.iter().map(|t| t.content.len()).sum();
+            let used_tokens = used_chars / 4; // 粗估：4字符≈1 token
+            let ctx_window = {
+                let provider = ModelsConfig::load()
+                    .ok()
+                    .and_then(|mc| mc.models.iter().find(|m| m.name == model_name).map(|m| m.provider.clone()))
+                    .unwrap_or_else(|| "openai".to_string());
+                let ctx_k: usize = estimate_context_size(&provider, &model_name).parse().unwrap_or(128);
+                ctx_k * 1000
+            };
+            if used_tokens > 0 {
+                print_context_bar(used_tokens, ctx_window);
+            }
+        }
+    }
+
+    run_interactive_with_session(&engine, args, effective_session).await
 }
 
 // ─────────────────────────────────────────────
@@ -227,7 +579,7 @@ fn print_welcome(model: &str, skill_count: usize, session: Option<&str>, interac
 
     // 上下文大小（估算）
     let ctx_size = estimate_context_size(&model_provider, model);
-    println!("  {}Context  {} {}{}k tokens{}", 
+    println!("  {}Context  {} {}{} k tokens{}", 
         GRAY,
         "◈",
         BRIGHT_WHITE, ctx_size, RESET
@@ -264,27 +616,34 @@ fn print_welcome(model: &str, skill_count: usize, session: Option<&str>, interac
     }
 }
 
-/// 估算模型上下文窗口大小（k tokens）
-fn estimate_context_size(provider: &str, model: &str) -> &'static str {
+/// 估算模型上下文窗口大小（k tokens），优先从 ModelsConfig 读取 max_tokens
+fn estimate_context_size(_provider: &str, model: &str) -> String {
+    // 优先从配置文件读取 max_tokens
+    if let Ok(mc) = ModelsConfig::load() {
+        if let Some(m) = mc.models.iter().find(|m| m.name == model) {
+            if let Some(max_tok) = m.max_tokens {
+                return format!("{}", max_tok / 1000);
+            }
+        }
+    }
+    // 按模型名称推断
     let model_lower = model.to_lowercase();
     if model_lower.contains("claude-3-5") || model_lower.contains("claude-3.5") {
-        "200"
+        "200".to_string()
     } else if model_lower.contains("claude-3") {
-        "200"
+        "200".to_string()
     } else if model_lower.contains("gpt-4o") {
-        "128"
+        "128".to_string()
     } else if model_lower.contains("gpt-4-turbo") {
-        "128"
+        "128".to_string()
     } else if model_lower.contains("gpt-4") {
-        "8"
+        "8".to_string()
     } else if model_lower.contains("gpt-3.5") {
-        "16"
+        "16".to_string()
     } else if model_lower.contains("o1") || model_lower.contains("o3") {
-        "200"
-    } else if provider == "local" {
-        "32"
+        "200".to_string()
     } else {
-        "128"
+        "128".to_string()
     }
 }
 
@@ -387,17 +746,53 @@ async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs) -> 
 // 交互式循环
 // ─────────────────────────────────────────────
 
-async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
+// ─────────────────────────────────────────────
+// Session 持久化记忆（last_session）
+// ─────────────────────────────────────────────
+
+/// 读取上次退出时的 session ID（~/.numina/last_session）
+fn load_last_session_id() -> Option<String> {
+    let path = dirs::home_dir()?.join(".numina").join("last_session");
+    let sid = std::fs::read_to_string(path).ok()?.trim().to_string();
+    if sid.is_empty() {
+        None
+    } else {
+        // 验证 session 文件确实存在
+        ChatEngine::get_session(&sid).ok().map(|_| sid)
+    }
+}
+
+/// 保存当前 session ID 到 ~/.numina/last_session
+fn save_last_session_id(sid: &str) {
+    if let Some(dir) = dirs::home_dir().map(|h| h.join(".numina")) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("last_session"), sid);
+    }
+}
+
+/// 清除 last_session（/new 时调用）
+fn clear_last_session_id() {
+    if let Some(path) = dirs::home_dir().map(|h| h.join(".numina").join("last_session")) {
+        let _ = std::fs::write(path, "");
+    }
+}
+
+async fn run_interactive_with_session(
+    engine: &ChatEngine,
+    args: &ChatArgs,
+    initial_session: Option<String>,
+) -> Result<()> {
     let model_override = args.model.as_deref();
-    let mut current_session: Option<String> = args.session.clone();
+    let mut current_session: Option<String> = initial_session;
     let mut turn_count = 0usize;
 
     // 初始化 rustyline editor（Tab 补全 + 历史记录）
+    // Circular 模式：Tab 循环选择候选项
     let rl_config = Config::builder()
-        .completion_type(CompletionType::List)
+        .completion_type(CompletionType::Circular)
         .build();
-    let mut rl: Editor<SlashCompleter, _> = Editor::with_config(rl_config)?;
-    rl.set_helper(Some(SlashCompleter));
+    let mut rl: Editor<ChatCompleter, _> = Editor::with_config(rl_config)?;
+    rl.set_helper(Some(ChatCompleter::new()));
 
     // 加载历史记录（忽略错误）
     let history_path = dirs::home_dir()
@@ -415,6 +810,8 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() {
                     let _ = rl.add_history_entry(&trimmed);
+                    // 每次输入后立即追加保存，防止强制退出丢失历史
+                    let _ = rl.append_history(&history_path);
                 }
                 trimmed
             }
@@ -466,6 +863,7 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
             "/new" => {
                 current_session = None;
                 turn_count = 0;
+                clear_last_session_id();
                 println!("{}✅ Started a new session.{}", GREEN, RESET);
                 println!();
                 continue;
@@ -507,6 +905,13 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
 
         turn_count += 1;
 
+        // 展开 @文件 引用
+        let (expanded_input, at_count) = expand_at_references(input);
+        if at_count > 0 {
+            println!("  {}📎 Attached {} file(s){}", GRAY, at_count, RESET);
+        }
+        let input = expanded_input.as_str();
+
         // 发送消息
         if args.stream {
             let (mut rx, sid, sent_tokens, ctx_window) = match engine
@@ -524,11 +929,78 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
             print!("{}{}Numina{} ", BOLD, CYAN, RESET);
             std::io::stdout().flush()?;
 
-            let mut full_response = String::new();
+            // 流式接收：\x00R 前缀 = reasoning（暗灰色思考过程），\x00C 前缀 = content（正常回答）
+            let mut full_response = String::new();  // 只保存 content 部分
+            let mut in_reasoning = false;
+            let mut reasoning_started = false;
+            // 代码块渲染状态
+            let mut in_code_block = false;
+            let mut line_buf = String::new(); // 行缓冲，用于检测 ``` 标记
             while let Some(token) = rx.recv().await {
-                print!("{}", token);
-                std::io::stdout().flush()?;
-                full_response.push_str(&token);
+                if let Some(text) = token.strip_prefix("\x00R") {
+                    // 思考过程：暗灰色显示
+                    if !reasoning_started {
+                        print!("{}{}[thinking] ", DIM, GRAY);
+                        reasoning_started = true;
+                        in_reasoning = true;
+                    }
+                    print!("{}", text);
+                    std::io::stdout().flush()?;
+                } else if let Some(text) = token.strip_prefix("\x00C") {
+                    // 正常回答：如果之前有思考过程，先换行重置颜色
+                    if in_reasoning {
+                        println!("{}", RESET);
+                        println!();
+                        print!("{}{}Numina{} ", BOLD, CYAN, RESET);
+                        in_reasoning = false;
+                    }
+                    // 代码块检测：逐字符处理，检测换行时判断是否有 ``` 标记
+                    for ch in text.chars() {
+                        line_buf.push(ch);
+                        if ch == '\n' {
+                            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+                            if trimmed.starts_with("```") {
+                                if in_code_block {
+                                    // 结束代码块：打印关闭行 + 重置背景
+                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                    in_code_block = false;
+                                } else {
+                                    // 开始代码块：打印开启行 + 设置背景
+                                    in_code_block = true;
+                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                }
+                            } else if in_code_block {
+                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                            } else {
+                                print!("{}\n", trimmed);
+                            }
+                            std::io::stdout().flush()?;
+                            line_buf.clear();
+                        }
+                    }
+                    // 打印行缓冲中未换行的部分
+                    if !line_buf.is_empty() {
+                        if in_code_block {
+                            print!("{}{}{}", CODE_BG, CODE_FG, line_buf);
+                        } else {
+                            print!("{}", line_buf);
+                        }
+                        std::io::stdout().flush()?;
+                        line_buf.clear();
+                    }
+                    full_response.push_str(text);
+                } else {
+                    // 兼容无前缀的 token（其他 provider）
+                    print!("{}", token);
+                    std::io::stdout().flush()?;
+                    full_response.push_str(&token);
+                }
+            }
+            if in_code_block {
+                print!("{}", RESET); // 确保代码块颜色被重置
+            }
+            if in_reasoning {
+                print!("{}", RESET);
             }
             println!();
             println!();
@@ -540,7 +1012,8 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
                 eprintln!("{}⚠️  Failed to save session: {}{}", YELLOW, e, RESET);
             }
 
-            current_session = Some(sid);
+            current_session = Some(sid.clone());
+            save_last_session_id(&sid);
         } else {
             match engine
                 .chat_once(input, model_override, current_session.as_deref())
@@ -553,7 +1026,8 @@ async fn run_interactive(engine: &ChatEngine, args: &ChatArgs) -> Result<()> {
 
                     print_context_bar(used_tokens, ctx_window);
 
-                    current_session = Some(sid);
+                    current_session = Some(sid.clone());
+                    save_last_session_id(&sid);
                 }
                 Err(e) => {
                     eprintln!("\n{}❌ Error: {}{}\n", YELLOW, e, RESET);
@@ -584,6 +1058,8 @@ fn print_help() {
     println!();
     println!("  {}Tip:{} Press {}Ctrl+D{} to exit, {}Ctrl+C{} to cancel input.",
         GRAY, RESET, BOLD, RESET, BOLD, RESET);
+    println!("  {}      Use {}@path{} to attach a file or directory to your message.",
+        GRAY, BOLD, RESET);
     println!();
 }
 
@@ -627,11 +1103,10 @@ fn cmd_sessions() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────
-// /model 交互式选择器
+// /model 选择器（简单文本菜单，无 raw mode）
 // ─────────────────────────────────────────────
 
-/// 用上下键选择模型，Enter 确认切换，Esc/q 取消
-/// 返回 Some(name) 表示已切换，None 表示取消
+/// 列出模型让用户输入编号选择，返回 Some(name) 表示已切换，None 表示取消
 fn cmd_model_picker() -> Result<Option<String>> {
     let mut cfg = match ModelsConfig::load() {
         Ok(c) => c,
@@ -646,103 +1121,48 @@ fn cmd_model_picker() -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // 找到当前 active 的索引
-    let active_idx = cfg.models.iter().position(|m| m.name == cfg.active).unwrap_or(0);
-    let mut selected = active_idx;
-    let count = cfg.models.len();
-
-    // 进入 raw mode
-    terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-
-    // 渲染函数（用 lines_drawn 追踪行数，每次重绘先 MoveUp 回到起始行）
-    let render_models = |stdout: &mut std::io::Stdout,
-                         models: &[ModelEntry],
-                         sel: usize,
-                         active: &str,
-                         lines_drawn: &mut u16| -> Result<()> {
-        if *lines_drawn > 0 {
-            execute!(stdout, cursor::MoveUp(*lines_drawn))?;
-        }
-        execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::FromCursorDown))?;
-
-        let mut drawn: u16 = 0;
-        macro_rules! pline {
-            ($s:expr) => {{
-                execute!(stdout, Print($s))?;
-                drawn += 1;
-            }};
-        }
-
-        pline!(format!("\r\n  {}{}Models{} {}(↑↓ navigate · Enter select · Esc cancel){}\r\n",
-            BOLD, BRIGHT_WHITE, RESET, GRAY, RESET));
-        pline!(format!("  {}{}\r\n", GRAY, "─".repeat(56)));
-
-        for (i, m) in models.iter().enumerate() {
-            let is_sel = i == sel;
-            let is_active = m.name == active;
-            let cursor_str = if is_sel { "❯ " } else { "  " };
-            let active_dot = if is_active { format!(" {}●{}", "\x1b[32m", RESET) } else { String::new() };
-            let ctx_k = m.max_tokens.map(|t| format!("{}k", t / 1000)).unwrap_or_else(|| "?k".to_string());
-            if is_sel {
-                pline!(format!("  {}{}{}{}{}{} {}{}{} {}({}){}  {}{}{}\r\n",
-                    BOLD, "\x1b[96m", cursor_str, m.name, active_dot, RESET,
-                    GRAY, m.provider, RESET,
-                    GRAY, ctx_k, RESET,
-                    DIM, m.description.as_deref().unwrap_or(""), RESET,
-                ));
-            } else {
-                pline!(format!("  {}{}{} {}{}{}{} {}({}){}  {}{}{}\r\n",
-                    GRAY, cursor_str, RESET,
-                    BOLD, m.name, active_dot, RESET,
-                    GRAY, m.provider, RESET,
-                    DIM, m.description.as_deref().unwrap_or(""), RESET,
-                ));
-            }
-        }
-        pline!(format!("  {}{}\r\n", GRAY, "─".repeat(56)));
-        stdout.flush()?;
-        *lines_drawn = drawn;
-        Ok(())
-    };
-
-    let mut lines_drawn: u16 = 0;
-    let active_clone = cfg.active.clone();
-    render_models(&mut stdout, &cfg.models, selected, &active_clone, &mut lines_drawn)?;
-
-    let result = loop {
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if selected > 0 { selected -= 1; } else { selected = count - 1; }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % count;
-                }
-                KeyCode::Enter => {
-                    let name = cfg.models[selected].name.clone();
-                    cfg.active = name.clone();
-                    let _ = cfg.save();
-                    break Some(name);
-                }
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    break None;
-                }
-                _ => {}
-            }
-            let active_clone = cfg.active.clone();
-            render_models(&mut stdout, &cfg.models, selected, &active_clone, &mut lines_drawn)?;
-        }
-    };
-
-    terminal::disable_raw_mode()?;
-    if lines_drawn > 0 {
-        execute!(stdout, cursor::MoveUp(lines_drawn))?;
-    }
-    execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::FromCursorDown))?;
     println!();
+    println!("  {}{}Models{} {}(enter number to select · Enter to cancel){}",
+        BOLD, BRIGHT_WHITE, RESET, GRAY, RESET);
+    println!("  {}{}{}", GRAY, "─".repeat(56), RESET);
 
-    Ok(result)
+    for (i, m) in cfg.models.iter().enumerate() {
+        let is_active = m.name == cfg.active;
+        let active_dot = if is_active { format!(" {}●{}", "\x1b[32m", RESET) } else { String::new() };
+        let ctx_k = m.max_tokens.map(|t| format!("{}k", t / 1000)).unwrap_or_else(|| "?k".to_string());
+        println!("  {}{}{}{}. {}{}{}{} {}({}){}  {}({}){} {}{}{}",
+            BOLD, BRIGHT_WHITE, i + 1, RESET,
+            BOLD, m.name, active_dot, RESET,
+            GRAY, m.provider, RESET,
+            GRAY, ctx_k, RESET,
+            DIM, m.description.as_deref().unwrap_or(""), RESET,
+        );
+    }
+    println!("  {}{}{}", GRAY, "─".repeat(56), RESET);
+    print!("  {}Select [1-{}] or Enter to cancel:{} ", GRAY, cfg.models.len(), RESET);
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        println!("{}Cancelled.{}", GRAY, RESET);
+        return Ok(None);
+    }
+
+    match input.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= cfg.models.len() => {
+            let name = cfg.models[n - 1].name.clone();
+            cfg.active = name.clone();
+            let _ = cfg.save();
+            Ok(Some(name))
+        }
+        _ => {
+            println!("{}Invalid selection.{}", YELLOW, RESET);
+            Ok(None)
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -827,7 +1247,7 @@ fn fetch_mcp_tools(srv: &McpServerEntry) -> Vec<(String, String, Vec<(String, St
     tools
 }
 
-/// MCP 浏览器：上下键选 server，Enter 展开查看 tools，Esc 返回
+/// MCP 浏览器：列出 server，输入编号查看 tools
 async fn cmd_mcp_browser() -> Result<()> {
     let cfg = match McpFileConfig::load() {
         Ok(c) => c,
@@ -842,154 +1262,82 @@ async fn cmd_mcp_browser() -> Result<()> {
         return Ok(());
     }
 
-    let servers = cfg.servers;
-    let count = servers.len();
-    let mut selected = 0usize;
-    // expanded[i] = Some(tools) 表示已展开，None 表示未展开
-    let mut expanded: Vec<Option<Vec<(String, String, Vec<(String, String, bool)>)>>> = vec![None; count];
-
-    terminal::enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-
-    // 计算渲染行数（用于回滚光标）
-    let count_render_lines = |expanded: &[Option<Vec<(String, String, Vec<(String, String, bool)>)>>],
-                               servers: &[McpServerEntry]| -> u16 {
-        let mut lines: u16 = 4; // header(2) + separator(2)
-        for (i, _) in servers.iter().enumerate() {
-            lines += 1; // server 行
-            if let Some(tools) = &expanded[i] {
-                if tools.is_empty() {
-                    lines += 1;
-                } else {
-                    for (_, _, params) in tools {
-                        lines += 1; // tool name
-                        if true { lines += 1; } // desc（保守估计）
-                        lines += params.len() as u16;
-                    }
-                }
-            }
-        }
-        lines += 1; // bottom separator
-        lines
-    };
-
-    let render_servers = |stdout: &mut std::io::Stdout,
-                          servers: &[McpServerEntry],
-                          expanded: &[Option<Vec<(String, String, Vec<(String, String, bool)>)>>],
-                          sel: usize,
-                          lines_drawn: &mut u16| -> Result<()> {
-        // 回到起始行
-        if *lines_drawn > 0 {
-            execute!(stdout, cursor::MoveUp(*lines_drawn))?;
-        }
-        execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::FromCursorDown))?;
-
-        let mut drawn: u16 = 0;
-        let print_line = |stdout: &mut std::io::Stdout, s: String, cnt: &mut u16| -> Result<()> {
-            execute!(stdout, Print(s))?;
-            *cnt += 1;
-            Ok(())
-        };
-
-        print_line(stdout, format!("\r\n  {}{}MCP Servers{} {}(↑↓ navigate · Enter expand/collapse · Esc close){}\r\n",
-            BOLD, BRIGHT_WHITE, RESET, GRAY, RESET), &mut drawn)?;
-        print_line(stdout, format!("  {}{}\r\n", GRAY, "─".repeat(60)), &mut drawn)?;
-
-        for (i, srv) in servers.iter().enumerate() {
-            let is_sel = i == sel;
-            let cursor_str = if is_sel { "❯ " } else { "  " };
-            let status = if srv.enabled { format!("{}●{}", "\x1b[32m", RESET) } else { format!("{}○{}", GRAY, RESET) };
-
-            if is_sel {
-                print_line(stdout, format!("  {}{}{}{} {} {}{}{} {}[{}]{}\r\n",
-                    BOLD, "\x1b[96m", cursor_str, RESET,
-                    status,
-                    BOLD, srv.name, RESET,
-                    GRAY, srv.server_type, RESET,
-                ), &mut drawn)?;
-            } else {
-                print_line(stdout, format!("  {}{}{} {} {}{}{} {}[{}]{}\r\n",
-                    GRAY, cursor_str, RESET,
-                    status,
-                    BOLD, srv.name, RESET,
-                    GRAY, srv.server_type, RESET,
-                ), &mut drawn)?;
-            }
-
-            if let Some(tools) = &expanded[i] {
-                if tools.is_empty() {
-                    print_line(stdout, format!("       {}  (no tools found or server not reachable){}\r\n", GRAY, RESET), &mut drawn)?;
-                } else {
-                    for (tname, tdesc, tparams) in tools {
-                        print_line(stdout, format!("       {}◆ {}{}{}{}\r\n",
-                            "\x1b[33m", RESET, BOLD, tname, RESET), &mut drawn)?;
-                        if !tdesc.is_empty() {
-                            print_line(stdout, format!("         {}  {}{}\r\n", GRAY, tdesc, RESET), &mut drawn)?;
-                        }
-                        for (pname, ptype, req) in tparams {
-                            let req_mark = if *req { format!("{}*{}", "\x1b[31m", RESET) } else { format!("{}?{}", GRAY, RESET) };
-                            print_line(stdout, format!("         {}  {} {}{}{}: {}{}{}\r\n",
-                                DIM, req_mark,
-                                "\x1b[96m", pname, RESET,
-                                GRAY, ptype, RESET), &mut drawn)?;
-                        }
-                    }
-                }
-            }
-        }
-        print_line(stdout, format!("  {}{}\r\n", GRAY, "─".repeat(60)), &mut drawn)?;
-        stdout.flush()?;
-        *lines_drawn = drawn;
-        Ok(())
-    };
-
-    let mut lines_drawn: u16 = 0;
-    render_servers(&mut stdout, &servers, &expanded, selected, &mut lines_drawn)?;
+    let servers = &cfg.servers;
 
     loop {
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if selected > 0 { selected -= 1; } else { selected = count - 1; }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1) % count;
-                }
-                KeyCode::Enter => {
-                    if expanded[selected].is_some() {
-                        expanded[selected] = None;
-                    } else {
-                        // 显示 loading 提示
-                        if lines_drawn > 0 {
-                            execute!(stdout, cursor::MoveUp(lines_drawn))?;
-                        }
-                        execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::FromCursorDown))?;
-                        execute!(stdout, Print(format!("  {}⏳ Fetching tools from {}...{}\r\n",
-                            GRAY, servers[selected].name, RESET)))?;
-                        stdout.flush()?;
-                        lines_drawn = 1;
+        println!();
+        println!("  {}{}MCP Servers{} {}(enter number to view tools · Enter to exit){}",
+            BOLD, BRIGHT_WHITE, RESET, GRAY, RESET);
+        println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
 
-                        terminal::disable_raw_mode()?;
-                        let tools = fetch_mcp_tools(&servers[selected]);
-                        terminal::enable_raw_mode()?;
-                        expanded[selected] = Some(tools);
+        for (i, srv) in servers.iter().enumerate() {
+            let status = if srv.enabled {
+                format!("{}●{}", "\x1b[32m", RESET)
+            } else {
+                format!("{}○{}", GRAY, RESET)
+            };
+            println!("  {}{}{}{}. {} {}{}{} {}[{}]{}",
+                BOLD, BRIGHT_WHITE, i + 1, RESET,
+                status,
+                BOLD, srv.name, RESET,
+                GRAY, srv.server_type, RESET,
+            );
+        }
+        println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
+        print!("  {}Select [1-{}] or Enter to exit:{} ", GRAY, servers.len(), RESET);
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input.is_empty() {
+            break;
+        }
+
+        match input.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= servers.len() => {
+                let srv = &servers[n - 1];
+                println!();
+                println!("  {}⏳ Fetching tools from {}...{}", GRAY, srv.name, RESET);
+                let tools = fetch_mcp_tools(srv);
+
+                println!();
+                println!("  {}{}Tools for: {}{}{}", BOLD, BRIGHT_WHITE, "\x1b[96m", srv.name, RESET);
+                println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
+
+                if tools.is_empty() {
+                    println!("  {}  (no tools found or server not reachable){}", GRAY, RESET);
+                } else {
+                    for (tname, tdesc, tparams) in &tools {
+                        println!("  {}◆ {}{}{}{}", "\x1b[33m", RESET, BOLD, tname, RESET);
+                        if !tdesc.is_empty() {
+                            // 截断长描述
+                            let preview: String = tdesc.chars().take(80).collect();
+                            let ellipsis = if tdesc.len() > 80 { "..." } else { "" };
+                            println!("     {}  {}{}{}", GRAY, preview, ellipsis, RESET);
+                        }
+                        for (pname, ptype, req) in tparams {
+                            let req_mark = if *req {
+                                format!("{}*{}", "\x1b[31m", RESET)
+                            } else {
+                                format!("{}?{}", GRAY, RESET)
+                            };
+                            println!("     {}  {} {}{}{}: {}{}{}",
+                                DIM, req_mark,
+                                "\x1b[96m", pname, RESET,
+                                GRAY, ptype, RESET);
+                        }
                     }
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    break;
-                }
-                _ => {}
+                println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
             }
-            render_servers(&mut stdout, &servers, &expanded, selected, &mut lines_drawn)?;
+            _ => {
+                println!("{}Invalid selection.{}", YELLOW, RESET);
+            }
         }
     }
 
-    terminal::disable_raw_mode()?;
-    if lines_drawn > 0 {
-        execute!(stdout, cursor::MoveUp(lines_drawn))?;
-    }
-    execute!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::FromCursorDown))?;
-    println!();
     Ok(())
 }
 
