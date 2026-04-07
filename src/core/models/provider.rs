@@ -5,10 +5,60 @@ use serde::{Deserialize, Serialize};
 // 基础消息类型
 // ─────────────────────────────────────────────
 
+/// 通用消息结构体
+/// - 普通消息：role + content
+/// - Assistant 工具调用消息：role=Assistant + content(可空) + tool_calls
+/// - Tool 结果消息：role=Tool + content + tool_call_id + name
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Assistant 消息中的工具调用列表（仅 role=Assistant 时有效）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// Tool 结果消息的调用 ID（仅 role=Tool 时有效）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool 结果消息的工具名称（仅 role=Tool 时有效）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+}
+
+impl Message {
+    /// 创建普通用户/系统/助手消息
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    /// 创建 assistant 工具调用消息
+    pub fn assistant_tool_calls(content: impl Into<String>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    /// 创建 tool 结果消息
+    pub fn tool_result(tool_call_id: impl Into<String>, name: impl Into<String>, content: impl Into<String>) -> Self {
+        let id = tool_call_id.into();
+        let n = name.into();
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            tool_calls: vec![],
+            tool_call_id: Some(id),
+            tool_name: Some(n),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -16,7 +16,10 @@ use crate::config::{NuminaConfig, ModelsConfig};
 use crate::core::skills::SkillManager;
 use crate::core::models::{
     AnthropicProvider, ChatResponse, LocalProvider, Message, ModelProvider, OpenAIProvider, Role,
+    ToolDefinition,
 };
+use crate::core::tools::builtin::default_registry;
+use crate::core::models::provider::StopReason;
 
 // ─────────────────────────────────────────────
 // Session / Memory types
@@ -62,13 +65,13 @@ impl ChatSession {
     pub fn to_messages(&self) -> Vec<Message> {
         self.turns
             .iter()
-            .map(|t| Message {
-                role: match t.role.as_str() {
+            .map(|t| Message::new(
+                match t.role.as_str() {
                     "assistant" => Role::Assistant,
                     _ => Role::User,
                 },
-                content: t.content.clone(),
-            })
+                t.content.clone(),
+            ))
             .collect()
     }
 }
@@ -291,10 +294,7 @@ impl ChatEngine {
 
         // 构建完整消息列表（system + history）
         let system_prompt = self.build_system_prompt();
-        let mut messages = vec![Message {
-            role: Role::System,
-            content: system_prompt,
-        }];
+        let mut messages = vec![Message::new(Role::System, system_prompt)];
         messages.extend(session.to_messages());
 
         // 估算发送的 token 数（字符数 / 4 粗略估算）
@@ -343,10 +343,7 @@ impl ChatEngine {
         self.build_messages_with_compression(&mut session, context_window);
 
         let system_prompt = self.build_system_prompt();
-        let mut messages = vec![Message {
-            role: Role::System,
-            content: system_prompt,
-        }];
+        let mut messages = vec![Message::new(Role::System, system_prompt)];
         messages.extend(session.to_messages());
 
         // 估算发送的 token 数（字符数 / 4 粗略估算）
@@ -359,6 +356,220 @@ impl ChatEngine {
         // 注意：流式模式下 session 的 assistant turn 需要调用方在收完后追加
         // 这里先保存压缩后的 session（不含 assistant 回复），调用方负责调用 append_assistant_turn
         save_session(&session)?;
+
+        Ok((rx, sid, sent_tokens, context_window))
+    }
+
+    /// ReAct 对话：带工具调用的对话循环
+    /// 通过 channel 实时推送输出事件：
+    ///   "\x00T{name}|{params}"  → 工具调用开始
+    ///   "\x00R{result}"         → 工具结果
+    ///   "\x00C{text}"           → 普通文本输出
+    ///   "\x00D"                 → 完成
+    /// 返回 (receiver, session_id, sent_tokens, context_window)
+    pub async fn chat_react(
+        &self,
+        user_message: &str,
+        model_override: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(tokio::sync::mpsc::Receiver<String>, String, usize, usize)> {
+        let (provider, model_name) = build_provider(&self.config, model_override)?;
+        let registry = default_registry();
+
+        // ReAct 模式：不加载旧 session 历史（旧历史是普通对话，没有工具上下文，会污染模型行为）
+        // 每次 ReAct 调用都是独立的工具对话，只保留 session ID 用于持久化
+        let session = match session_id {
+            Some(id) => load_session(id).unwrap_or_else(|_| ChatSession::new(&model_name)),
+            None => ChatSession::new(&model_name),
+        };
+
+        let context_window = self.get_context_window(model_override);
+
+        // 构建工具定义
+        let tool_defs: Vec<ToolDefinition> = registry
+            .list_tools()
+            .into_iter()
+            .filter_map(|name| {
+                let executor = registry.get(&name)?;
+                Some(ToolDefinition {
+                    name,
+                    description: executor.description().to_string(),
+                    parameters: executor.schema(),
+                })
+            })
+            .collect();
+
+        // 构建带工具能力的 system prompt
+        let system_prompt = {
+            let mut parts = vec![
+                "You are Numina, an AI coding assistant with tool use capabilities.\n\
+You are NOT Claude, NOT Claude Code. You are Numina.\n\
+\n\
+You have access to tools: read_file, write_file, edit_file, list_dir, shell, search_code, find_files, http_get, task_complete.\n\
+\n\
+## Tool Usage Rules\n\
+\n\
+When the user asks you to do something that requires executing commands, reading files, or interacting with the system:\n\
+- USE the tools directly. Do NOT say you cannot execute commands.\n\
+- NEVER calculate or estimate results yourself — always use tools to get real data.\n\
+- For counting lines of code: use shell with `find . -name \"*.rs\" -not -path \"*/target/*\" | xargs wc -l 2>/dev/null | tail -1` or similar.\n\
+- For listing files: use shell with `find` or `ls` commands, NOT list_dir with recursive=true (too slow).\n\
+- For analyzing a directory: use shell to run commands like `find . -name \"*.rs\" | wc -l` to count files.\n\
+- When multiple independent tasks can be done in parallel, call multiple tools in a SINGLE response.\n\
+- After getting tool results, summarize them clearly and accurately for the user.\n\
+\n\
+## Parallel Execution\n\
+\n\
+If the user asks to analyze multiple files or perform multiple independent operations, call ALL the tools at once in a single response (the system will execute them concurrently). For example:\n\
+- To count lines in multiple files: call shell once with a command that counts all files at once.\n\
+- To read multiple files: call read_file for each file in the same response.\n\
+\n\
+Be concise and action-oriented. Always use tools to get real data.".to_string(),
+            ];
+            let skills = self.skill_manager.skills();
+            if !skills.is_empty() {
+                parts.push("\n## Available Skills".to_string());
+                for skill in skills {
+                    parts.push(format!("### {}\n{}", skill.name, skill.description));
+                }
+            }
+            parts.join("\n")
+        };
+
+        // 构建消息列表：system + 当前用户消息（不带旧历史，避免污染工具调用上下文）
+        let mut messages = vec![
+            Message::new(Role::System, system_prompt),
+            Message::new(Role::User, user_message),
+        ];
+
+        let sid = session.id.clone();
+        let sid2 = sid.clone();
+
+        // 估算发送的 token 数（字符数 / 4 粗略估算）
+        let sent_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+        let sent_tokens = sent_chars / 4;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+
+        // 在后台任务中运行 ReAct 循环
+        tokio::spawn(async move {
+            const MAX_STEPS: usize = 10;
+            let mut full_reply = String::new();
+
+            for _step in 0..MAX_STEPS {
+                // 调用模型（带工具）
+                let response = match provider.chat_with_tools(&messages, &tool_defs).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(format!("\x00C❌ Error: {}", e)).await;
+                        break;
+                    }
+                };
+
+                match response.stop_reason {
+                    StopReason::ToolCalls if !response.tool_calls.is_empty() => {
+                        // 有工具调用：先输出思考内容（如果有）
+                        if !response.content.is_empty() {
+                            let _ = tx.send(format!("\x00C{}\n", response.content)).await;
+                            full_reply.push_str(&response.content);
+                            full_reply.push('\n');
+                        }
+
+                        // 把 assistant 工具调用消息加入对话历史
+                        messages.push(Message::assistant_tool_calls(
+                            response.content.clone(),
+                            response.tool_calls.clone(),
+                        ));
+
+                        // ── 并发执行所有工具调用 ──
+                        // 先通知 UI 所有工具调用开始（顺序通知，避免乱序）
+                        for tool_call in &response.tool_calls {
+                            let params_preview = match tool_call.name.as_str() {
+                                "shell" => tool_call.arguments["command"].as_str().unwrap_or("").to_string(),
+                                "read_file" | "write_file" | "edit_file" => {
+                                    tool_call.arguments["path"].as_str().unwrap_or("").to_string()
+                                }
+                                _ => {
+                                    let s = serde_json::to_string(&tool_call.arguments).unwrap_or_default();
+                                    s.chars().take(80).collect()
+                                }
+                            };
+                            let _ = tx.send(format!("\x00T{}|{}", tool_call.name, params_preview)).await;
+                        }
+
+                        // 并发执行所有工具（tokio::join_all）
+                        let tool_futures: Vec<_> = response.tool_calls.iter().map(|tc| {
+                            let reg = &registry;
+                            let name = tc.name.clone();
+                            let args = tc.arguments.clone();
+                            async move {
+                                match reg.execute(&name, args).await {
+                                    Ok(r) => {
+                                        if r.success {
+                                            r.data.get("content")
+                                                .and_then(|v| v.as_str())
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| serde_json::to_string_pretty(&r.data).unwrap_or_default())
+                                        } else {
+                                            format!("Error: {}", r.error.as_deref().unwrap_or("unknown"))
+                                        }
+                                    }
+                                    Err(e) => format!("Tool execution failed: {}", e),
+                                }
+                            }
+                        }).collect();
+
+                        let results = futures::future::join_all(tool_futures).await;
+
+                        // 按顺序通知 UI 结果，并加入对话历史
+                        // 工具结果截断：防止超长内容（如大目录列表）撑爆模型上下文
+                        const MAX_TOOL_RESULT_CHARS: usize = 8000;
+                        for (tool_call, result_str) in response.tool_calls.iter().zip(results.iter()) {
+                            let _ = tx.send(format!("\x00R{}", result_str)).await;
+                            // 截断后再加入 messages，避免超出模型 token 限制
+                            let truncated_result = if result_str.len() > MAX_TOOL_RESULT_CHARS {
+                                format!(
+                                    "{}\n\n[... truncated, {} chars total. Use more specific parameters to get focused results.]",
+                                    &result_str[..MAX_TOOL_RESULT_CHARS],
+                                    result_str.len()
+                                )
+                            } else {
+                                result_str.clone()
+                            };
+                            messages.push(Message::tool_result(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &truncated_result,
+                            ));
+                        }
+                        // 通知 UI：工具执行完毕，等待模型下一轮响应（重新显示 thinking 动画）
+                        let _ = tx.send("\x00W".to_string()).await;
+                        // 继续循环，让模型处理工具结果
+                    }
+
+                    _ => {
+                        // 模型给出最终文本回复（无工具调用）
+                        let text = if response.content.is_empty() {
+                            "Done.".to_string()
+                        } else {
+                            response.content.clone()
+                        };
+                        let _ = tx.send(format!("\x00C{}", text)).await;
+                        full_reply.push_str(&text);
+                        break;
+                    }
+                }
+            }
+
+            // 完成信号
+            let _ = tx.send("\x00D".to_string()).await;
+
+            // 保存 session
+            if let Ok(mut sess) = load_session(&sid2) {
+                sess.push("assistant", &full_reply);
+                let _ = save_session(&sess);
+            }
+        });
 
         Ok((rx, sid, sent_tokens, context_window))
     }

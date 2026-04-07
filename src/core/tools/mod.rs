@@ -38,4 +38,14 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, parameters: serde_json::Value) -> anyhow::Result<ToolResult>;
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+
+    /// JSON Schema for the tool's parameters (used for function calling)
+    /// Default implementation returns a permissive schema.
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true
+        })
+    }
 }

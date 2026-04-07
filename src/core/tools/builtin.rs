@@ -2,12 +2,15 @@
 ///
 /// 每个工具都实现 `ToolExecutor` trait，参数通过 JSON 传入。
 /// 工具列表：
-///   - read_file      读取文件内容
+///   - read_file      读取文件内容（支持行范围）
 ///   - write_file     写入文件内容
+///   - edit_file      精确编辑文件（search/replace）
 ///   - list_dir       列出目录内容
 ///   - shell          执行 shell 命令（受限）
 ///   - search_code    在目录中搜索代码（grep）
 ///   - find_files     按文件名 glob 查找文件
+///   - http_get       发起 HTTP GET 请求
+///   - task_complete  标记任务完成并返回最终结果
 
 use super::{ToolExecutor, ToolResult};
 use async_trait::async_trait;
@@ -26,20 +29,39 @@ impl ToolExecutor for ReadFileTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("read_file: missing 'path' parameter"))?;
 
-        // 可选：限制读取行数
         let max_lines = params["max_lines"].as_u64().unwrap_or(500) as usize;
+        let start_line = params["start_line"].as_u64().map(|n| n as usize);
+        let end_line = params["end_line"].as_u64().map(|n| n as usize);
 
         match std::fs::read_to_string(path) {
             Ok(content) => {
-                let lines: Vec<&str> = content.lines().collect();
-                let total = lines.len();
-                let truncated = total > max_lines;
-                let shown: String = lines[..max_lines.min(total)].join("\n");
+                let all_lines: Vec<&str> = content.lines().collect();
+                let total = all_lines.len();
+
+                // 支持行范围读取
+                let (from, to) = if let (Some(s), Some(e)) = (start_line, end_line) {
+                    let s = s.saturating_sub(1).min(total);
+                    let e = e.min(total);
+                    (s, e)
+                } else {
+                    (0, max_lines.min(total))
+                };
+
+                let truncated = to < total && end_line.is_none();
+                // 带行号输出（类似 Claude Code 的 read_file）
+                let shown: String = all_lines[from..to]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| format!("{:>4} | {}", from + i + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
                 Ok(ToolResult {
                     success: true,
                     data: json!({
                         "content": shown,
                         "total_lines": total,
+                        "shown_lines": to - from,
                         "truncated": truncated,
                         "path": path,
                     }),
@@ -56,7 +78,19 @@ impl ToolExecutor for ReadFileTool {
 
     fn name(&self) -> &str { "read_file" }
     fn description(&self) -> &str {
-        "Read the contents of a file. Parameters: {\"path\": \"<file_path>\", \"max_lines\": <optional_number>}"
+        "Read the contents of a file with line numbers. Parameters: {\"path\": \"<file_path>\", \"max_lines\": <optional_number>, \"start_line\": <optional>, \"end_line\": <optional>}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The file path to read" },
+                "max_lines": { "type": "integer", "description": "Maximum number of lines to read (default: 500)" },
+                "start_line": { "type": "integer", "description": "Start line number (1-based, inclusive)" },
+                "end_line": { "type": "integer", "description": "End line number (1-based, inclusive)" }
+            },
+            "required": ["path"]
+        })
     }
 }
 
@@ -89,6 +123,7 @@ impl ToolExecutor for WriteFileTool {
                 data: json!({
                     "path": path,
                     "bytes_written": content.len(),
+                    "lines_written": content.lines().count(),
                 }),
                 error: None,
             }),
@@ -104,6 +139,83 @@ impl ToolExecutor for WriteFileTool {
     fn description(&self) -> &str {
         "Write content to a file (creates parent directories if needed). Parameters: {\"path\": \"<file_path>\", \"content\": \"<content>\"}"
     }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The file path to write" },
+                "content": { "type": "string", "description": "The content to write to the file" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+}
+
+// ─────────────────────────────────────────────
+// edit_file — 精确 search/replace 编辑
+// ─────────────────────────────────────────────
+
+pub struct EditFileTool;
+
+#[async_trait]
+impl ToolExecutor for EditFileTool {
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let path = params["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("edit_file: missing 'path' parameter"))?;
+        let search = params["search"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("edit_file: missing 'search' parameter"))?;
+        let replace = params["replace"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("edit_file: missing 'replace' parameter"))?;
+
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("edit_file: cannot read '{}': {}", path, e))?;
+
+        if !content.contains(search) {
+            return Ok(ToolResult {
+                success: false,
+                data: json!(null),
+                error: Some(format!(
+                    "edit_file: search string not found in '{}'. Make sure the search string exactly matches the file content.",
+                    path
+                )),
+            });
+        }
+
+        // 只替换第一次出现（精确编辑）
+        let new_content = content.replacen(search, replace, 1);
+        std::fs::write(path, &new_content)
+            .map_err(|e| anyhow::anyhow!("edit_file: cannot write '{}': {}", path, e))?;
+
+        Ok(ToolResult {
+            success: true,
+            data: json!({
+                "path": path,
+                "replaced": true,
+                "old_lines": search.lines().count(),
+                "new_lines": replace.lines().count(),
+            }),
+            error: None,
+        })
+    }
+
+    fn name(&self) -> &str { "edit_file" }
+    fn description(&self) -> &str {
+        "Precisely edit a file by replacing an exact string. Parameters: {\"path\": \"<file_path>\", \"search\": \"<exact_string_to_find>\", \"replace\": \"<replacement_string>\"}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The file path to edit" },
+                "search": { "type": "string", "description": "The exact string to search for (must match exactly including whitespace)" },
+                "replace": { "type": "string", "description": "The replacement string" }
+            },
+            "required": ["path", "search", "replace"]
+        })
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -117,42 +229,79 @@ impl ToolExecutor for ListDirTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
         let path = params["path"].as_str().unwrap_or(".");
         let recursive = params["recursive"].as_bool().unwrap_or(false);
+        let max_entries = params["max_entries"].as_u64().unwrap_or(200) as usize;
 
         let mut entries: Vec<serde_json::Value> = Vec::new();
 
         if recursive {
-            collect_recursive(std::path::Path::new(path), &mut entries, 0, 3)?;
+            collect_recursive(std::path::Path::new(path), &mut entries, 0, 3, max_entries)?;
         } else {
             let dir = std::fs::read_dir(path)
                 .map_err(|e| anyhow::anyhow!("list_dir: {}", e))?;
-            for entry in dir.flatten() {
+            let mut children: Vec<_> = dir.flatten().collect();
+            children.sort_by(|a, b| {
+                let a_dir = a.path().is_dir();
+                let b_dir = b.path().is_dir();
+                b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+            });
+            for entry in children.into_iter().take(max_entries) {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                // 非递归模式也过滤构建产物目录（但显示隐藏文件）
+                if should_skip(&name_str) {
+                    continue;
+                }
                 let meta = entry.metadata().ok();
                 let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
                 let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                 entries.push(json!({
-                    "name": entry.file_name().to_string_lossy(),
+                    "name": name_str,
                     "type": if is_dir { "dir" } else { "file" },
                     "size": size,
                 }));
             }
-            entries.sort_by(|a, b| {
-                let ta = a["type"].as_str().unwrap_or("");
-                let tb = b["type"].as_str().unwrap_or("");
-                tb.cmp(ta).then(a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")))
-            });
         }
 
+        let truncated = entries.len() >= max_entries;
         Ok(ToolResult {
             success: true,
-            data: json!({ "path": path, "entries": entries, "count": entries.len() }),
+            data: json!({
+                "path": path,
+                "entries": entries,
+                "count": entries.len(),
+                "truncated": truncated,
+                "note": if truncated { format!("Results truncated to {} entries. Use more specific path or increase max_entries.", max_entries) } else { String::new() }
+            }),
             error: None,
         })
     }
 
     fn name(&self) -> &str { "list_dir" }
     fn description(&self) -> &str {
-        "List files and directories. Parameters: {\"path\": \"<dir_path>\", \"recursive\": <bool>}"
+        "List files and directories. Parameters: {\"path\": \"<dir_path>\", \"recursive\": <bool>, \"max_entries\": <number>}"
     }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The directory path to list (default: current directory)" },
+                "recursive": { "type": "boolean", "description": "Whether to list recursively up to 3 levels deep (default: false)" },
+                "max_entries": { "type": "integer", "description": "Maximum number of entries to return (default: 200)" }
+            },
+            "required": []
+        })
+    }
+}
+
+/// 需要跳过的目录名（构建产物、版本控制、依赖等）
+const SKIP_DIRS: &[&str] = &[
+    "target", ".git", "node_modules", ".next", "dist", "build",
+    "__pycache__", ".cache", ".idea", ".vscode", "vendor",
+    ".cargo", "out", "coverage", ".nyc_output",
+];
+
+fn should_skip(name: &str) -> bool {
+    SKIP_DIRS.contains(&name)
 }
 
 fn collect_recursive(
@@ -160,23 +309,38 @@ fn collect_recursive(
     entries: &mut Vec<serde_json::Value>,
     depth: usize,
     max_depth: usize,
+    max_entries: usize,
 ) -> anyhow::Result<()> {
-    if depth > max_depth { return Ok(()); }
+    if depth > max_depth || entries.len() >= max_entries { return Ok(()); }
     let read = std::fs::read_dir(dir)?;
-    for entry in read.flatten() {
+    let mut children: Vec<_> = read.flatten().collect();
+    // 排序：目录优先，然后按名称
+    children.sort_by(|a, b| {
+        let a_dir = a.path().is_dir();
+        let b_dir = b.path().is_dir();
+        b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+    });
+    for entry in children {
+        if entries.len() >= max_entries { break; }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // 跳过隐藏文件（.开头）和构建产物目录
+        if name_str.starts_with('.') || should_skip(&name_str) {
+            continue;
+        }
         let meta = entry.metadata().ok();
         let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
         let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let path_str = entry.path().to_string_lossy().to_string();
         entries.push(json!({
-            "name": entry.file_name().to_string_lossy(),
+            "name": name_str,
             "path": path_str,
             "type": if is_dir { "dir" } else { "file" },
             "size": size,
             "depth": depth,
         }));
         if is_dir {
-            collect_recursive(&entry.path(), entries, depth + 1, max_depth)?;
+            collect_recursive(&entry.path(), entries, depth + 1, max_depth, max_entries)?;
         }
     }
     Ok(())
@@ -226,23 +390,44 @@ impl ToolExecutor for ShellTool {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let exit_code = output.status.code().unwrap_or(-1);
 
+        // 合并 stdout + stderr 为 content 字段，方便 agent 读取
+        let content = if stderr.is_empty() {
+            stdout.clone()
+        } else if stdout.is_empty() {
+            format!("[stderr]\n{}", stderr)
+        } else {
+            format!("{}\n[stderr]\n{}", stdout, stderr)
+        };
+
         Ok(ToolResult {
             success: output.status.success(),
             data: json!({
+                "content": content,
                 "stdout": stdout,
                 "stderr": stderr,
                 "exit_code": exit_code,
                 "command": command,
             }),
             error: if output.status.success() { None } else {
-                Some(format!("Command exited with code {}", exit_code))
+                Some(format!("Command exited with code {}: {}", exit_code, stderr.trim()))
             },
         })
     }
 
     fn name(&self) -> &str { "shell" }
     fn description(&self) -> &str {
-        "Execute a shell command. Parameters: {\"command\": \"<cmd>\", \"cwd\": \"<optional_dir>\", \"timeout\": <optional_seconds>}"
+        "Execute a shell command and return stdout/stderr. Parameters: {\"command\": \"<cmd>\", \"cwd\": \"<optional_dir>\", \"timeout\": <optional_seconds>}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "command": { "type": "string", "description": "The shell command to execute" },
+                "cwd": { "type": "string", "description": "Working directory for the command (default: current directory)" },
+                "timeout": { "type": "integer", "description": "Timeout in seconds (default: 30)" }
+            },
+            "required": ["command"]
+        })
     }
 }
 
@@ -262,7 +447,6 @@ impl ToolExecutor for SearchCodeTool {
         let file_pattern = params["file_pattern"].as_str().unwrap_or("*");
         let max_results = params["max_results"].as_u64().unwrap_or(50) as usize;
 
-        // 用 grep -rn 实现
         let grep_cmd = format!(
             "grep -rn --include='{}' -m {} '{}' '{}' 2>/dev/null | head -{}",
             file_pattern, max_results, pattern, path, max_results
@@ -280,7 +464,6 @@ impl ToolExecutor for SearchCodeTool {
             .lines()
             .filter(|l| !l.is_empty())
             .map(|line| {
-                // 格式: file:line:content
                 let parts: Vec<&str> = line.splitn(3, ':').collect();
                 if parts.len() == 3 {
                     json!({
@@ -294,9 +477,27 @@ impl ToolExecutor for SearchCodeTool {
             })
             .collect();
 
+        // 格式化为易读的 content 字段
+        let content = if matches.is_empty() {
+            format!("No matches found for pattern '{}' in '{}'", pattern, path)
+        } else {
+            matches.iter().map(|m| {
+                if let (Some(f), Some(l), Some(c)) = (
+                    m["file"].as_str(),
+                    m["line"].as_u64(),
+                    m["content"].as_str(),
+                ) {
+                    format!("{}:{}: {}", f, l, c)
+                } else {
+                    m["raw"].as_str().unwrap_or("").to_string()
+                }
+            }).collect::<Vec<_>>().join("\n")
+        };
+
         Ok(ToolResult {
             success: true,
             data: json!({
+                "content": content,
                 "pattern": pattern,
                 "path": path,
                 "matches": matches,
@@ -308,7 +509,19 @@ impl ToolExecutor for SearchCodeTool {
 
     fn name(&self) -> &str { "search_code" }
     fn description(&self) -> &str {
-        "Search for a pattern in code files. Parameters: {\"pattern\": \"<regex>\", \"path\": \"<dir>\", \"file_pattern\": \"*.rs\", \"max_results\": <number>}"
+        "Search for a pattern in code files using grep. Parameters: {\"pattern\": \"<regex>\", \"path\": \"<dir>\", \"file_pattern\": \"*.rs\", \"max_results\": <number>}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "The regex pattern to search for" },
+                "path": { "type": "string", "description": "The directory to search in (default: current directory)" },
+                "file_pattern": { "type": "string", "description": "File glob pattern to filter (e.g., '*.rs', '*.py')" },
+                "max_results": { "type": "integer", "description": "Maximum number of results to return (default: 50)" }
+            },
+            "required": ["pattern"]
+        })
     }
 }
 
@@ -339,19 +552,26 @@ impl ToolExecutor for FindFilesTool {
             .map_err(|e| anyhow::anyhow!("find_files failed: {}", e))?;
 
         let raw = String::from_utf8_lossy(&output.stdout).to_string();
-        let files_owned: Vec<String> = raw
+        let files: Vec<String> = raw
             .lines()
             .filter(|l| !l.is_empty())
             .map(|s| s.to_string())
             .collect();
 
+        let content = if files.is_empty() {
+            format!("No files found matching '{}' in '{}'", pattern, path)
+        } else {
+            files.join("\n")
+        };
+
         Ok(ToolResult {
             success: true,
             data: json!({
+                "content": content,
                 "pattern": pattern,
                 "path": path,
-                "files": files_owned,
-                "count": files_owned.len(),
+                "files": files,
+                "count": files.len(),
             }),
             error: None,
         })
@@ -360,6 +580,133 @@ impl ToolExecutor for FindFilesTool {
     fn name(&self) -> &str { "find_files" }
     fn description(&self) -> &str {
         "Find files by name pattern. Parameters: {\"pattern\": \"*.rs\", \"path\": \"<dir>\"}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": { "type": "string", "description": "Glob pattern to match files (e.g., '*.rs', 'main.*')" },
+                "path": { "type": "string", "description": "The directory to search in (default: current directory)" }
+            },
+            "required": ["pattern"]
+        })
+    }
+}
+
+// ─────────────────────────────────────────────
+// http_get — 发起 HTTP GET 请求
+// ─────────────────────────────────────────────
+
+pub struct HttpGetTool;
+
+#[async_trait]
+impl ToolExecutor for HttpGetTool {
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("http_get: missing 'url' parameter"))?;
+        let max_bytes = params["max_bytes"].as_u64().unwrap_or(32768) as usize;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .user_agent("Numina-Agent/0.1")
+            .build()
+            .map_err(|e| anyhow::anyhow!("http_get: failed to build client: {}", e))?;
+
+        match client.get(url).send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let headers: std::collections::HashMap<String, String> = resp
+                    .headers()
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        v.to_str().ok().map(|vs| (k.to_string(), vs.to_string()))
+                    })
+                    .collect();
+
+                let body = resp.text().await.unwrap_or_default();
+                let truncated = body.len() > max_bytes;
+                let content: String = body.chars().take(max_bytes).collect();
+
+                Ok(ToolResult {
+                    success: status < 400,
+                    data: json!({
+                        "content": content,
+                        "status": status,
+                        "url": url,
+                        "truncated": truncated,
+                        "content_type": headers.get("content-type").cloned().unwrap_or_default(),
+                    }),
+                    error: if status >= 400 {
+                        Some(format!("HTTP {} for {}", status, url))
+                    } else {
+                        None
+                    },
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                data: json!(null),
+                error: Some(format!("http_get failed for '{}': {}", url, e)),
+            }),
+        }
+    }
+
+    fn name(&self) -> &str { "http_get" }
+    fn description(&self) -> &str {
+        "Make an HTTP GET request and return the response body. Parameters: {\"url\": \"<url>\", \"max_bytes\": <optional_number>}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL to fetch" },
+                "max_bytes": { "type": "integer", "description": "Maximum response body size in bytes (default: 32768)" }
+            },
+            "required": ["url"]
+        })
+    }
+}
+
+// ─────────────────────────────────────────────
+// task_complete — 标记任务完成
+// ─────────────────────────────────────────────
+
+pub struct TaskCompleteTool;
+
+#[async_trait]
+impl ToolExecutor for TaskCompleteTool {
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let result = params["result"]
+            .as_str()
+            .unwrap_or("Task completed successfully.");
+        let summary = params["summary"].as_str().unwrap_or(result);
+
+        Ok(ToolResult {
+            success: true,
+            data: json!({
+                "content": result,
+                "result": result,
+                "summary": summary,
+                "completed": true,
+            }),
+            error: None,
+        })
+    }
+
+    fn name(&self) -> &str { "task_complete" }
+    fn description(&self) -> &str {
+        "Signal that the task is complete and provide the final result. Use this when you have finished all necessary steps. Parameters: {\"result\": \"<final_answer>\", \"summary\": \"<optional_summary>\"}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "result": { "type": "string", "description": "The final result or answer to the task" },
+                "summary": { "type": "string", "description": "A brief summary of what was accomplished" }
+            },
+            "required": ["result"]
+        })
     }
 }
 
@@ -404,9 +751,12 @@ pub fn default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     let _ = registry.register(Arc::new(ReadFileTool));
     let _ = registry.register(Arc::new(WriteFileTool));
+    let _ = registry.register(Arc::new(EditFileTool));
     let _ = registry.register(Arc::new(ListDirTool));
     let _ = registry.register(Arc::new(ShellTool));
     let _ = registry.register(Arc::new(SearchCodeTool));
     let _ = registry.register(Arc::new(FindFilesTool));
+    let _ = registry.register(Arc::new(HttpGetTool));
+    let _ = registry.register(Arc::new(TaskCompleteTool));
     registry
 }

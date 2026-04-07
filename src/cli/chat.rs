@@ -4,11 +4,10 @@ use std::borrow::Cow;
 use std::io::Write;
 
 use rustyline::completion::{Completer, Pair};
-use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
-use rustyline::{CompletionType, Config, Context, Editor, Helper};
+use rustyline::{Cmd, Context, Helper, Movement};
 
 use crate::config::{McpFileConfig, McpServerEntry, ModelEntry, ModelsConfig};
 use crate::core::chat::{ChatEngine, ChatSession};
@@ -75,6 +74,9 @@ impl ChatCompleter {
                 if parent_disp == "~" { "~/".to_string() } else { format!("{}/", parent_disp) }
             } else if parent == "." {
                 String::new()
+            } else if parent == "/" {
+                // 修复：避免绝对路径父目录产生 "//" 前缀
+                "/".to_string()
             } else {
                 format!("{}/", parent)
             };
@@ -136,30 +138,12 @@ impl Completer for ChatCompleter {
         if let Some(at_pos) = word.rfind('@') {
             let path_part = &word[at_pos + 1..];
             let candidates = Self::complete_path(path_part);
-            if !candidates.is_empty() {
-                // 在输入行下方打印竖向列表（写到 stderr，不干扰 readline）
-                eprint!("\r\n{}\x1b[38;5;244m{}\x1b[0m\r\n",
-                    "\x1b[48;5;238m\x1b[38;5;255m",
-                    "─".repeat(40));
-                for c in &candidates {
-                    if c.display.ends_with('/') {
-                        eprintln!("\x1b[48;5;238m\x1b[38;5;117m  {}\x1b[0m", c.display);
-                    } else {
-                        eprintln!("\x1b[48;5;238m\x1b[38;5;255m  {}\x1b[0m", c.display);
-                    }
-                }
-                eprint!("\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
-                    "─".repeat(40));
-                // 移回光标到输入行
-                let lines_printed = candidates.len() + 2;
-                eprint!("\x1b[{}A", lines_printed);
-            }
             return Ok((at_pos + 1, candidates));
         }
 
-        // / 斜杠命令补全：只在行首
+        // / 斜杠处理：行首 / 时优先匹配内置命令，无匹配则回退到绝对路径文件补全
         if word.starts_with('/') {
-            let matches: Vec<Pair> = SLASH_COMMANDS
+            let cmd_matches: Vec<Pair> = SLASH_COMMANDS
                 .iter()
                 .filter(|(cmd, _)| cmd.starts_with(word))
                 .map(|(cmd, desc)| Pair {
@@ -168,24 +152,16 @@ impl Completer for ChatCompleter {
                     replacement: cmd.to_string(),
                 })
                 .collect();
-            if !matches.is_empty() {
-                eprint!("\r\n\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
-                    "─".repeat(40));
-                for m in &matches {
-                    let parts: Vec<&str> = m.display.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        eprintln!("\x1b[48;5;238m  \x1b[97m\x1b[1m{:<14}\x1b[0m\x1b[48;5;238m\x1b[38;5;244m {}\x1b[0m",
-                            parts[0].trim(), parts[1].trim());
-                    } else {
-                        eprintln!("\x1b[48;5;238m\x1b[97m  {}\x1b[0m", m.display);
-                    }
-                }
-                eprint!("\x1b[48;5;238m\x1b[38;5;244m{}\x1b[0m\r\n",
-                    "─".repeat(40));
-                let lines_printed = matches.len() + 2;
-                eprint!("\x1b[{}A", lines_printed);
+
+            if !cmd_matches.is_empty() {
+                return Ok((0, cmd_matches));
             }
-            return Ok((0, matches));
+
+            // 不匹配任何内置命令 → 绝对路径文件系统补全（如 /home/、/etc/）
+            let file_candidates = Self::complete_path(word);
+            if !file_candidates.is_empty() {
+                return Ok((0, file_candidates));
+            }
         }
 
         Ok((pos, vec![]))
@@ -255,6 +231,624 @@ impl Highlighter for ChatCompleter {
 }
 
 impl Validator for ChatCompleter {}
+
+// ─────────────────────────────────────────────
+// 交互式竖向下拉补全（crossterm + Tab 键触发）
+// ─────────────────────────────────────────────
+
+const MAX_COMPLETION_DISPLAY: usize = 10;
+
+/// 根据当前输入 word 计算补全候选和起始字节偏移
+fn compute_candidates_for_str(word: &str) -> (Vec<Pair>, usize) {
+    // @ 文件路径补全
+    if let Some(at_pos) = word.rfind('@') {
+        let path_part = &word[at_pos + 1..];
+        let candidates = ChatCompleter::complete_path(path_part);
+        return (candidates, at_pos + 1);
+    }
+    // / 斜杠命令或绝对路径补全
+    if word.starts_with('/') {
+        let cmd_matches: Vec<Pair> = SLASH_COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(word))
+            .map(|(cmd, desc)| Pair {
+                display: format!("{:<14} {}", cmd, desc),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        if !cmd_matches.is_empty() {
+            return (cmd_matches, 0);
+        }
+        let file_candidates = ChatCompleter::complete_path(word);
+        if !file_candidates.is_empty() {
+            return (file_candidates, 0);
+        }
+    }
+    (vec![], 0)
+}
+
+/// 渲染单个候选项（带 ANSI 颜色和选中高亮）
+fn render_one_candidate(c: &Pair, selected: bool) -> String {
+    let bg = if selected { "\x1b[48;5;24m" } else { "\x1b[48;5;238m" };
+    let indicator = if selected { "\x1b[97m▶\x1b[0m" } else { " " };
+    if c.display.ends_with('/') {
+        // 目录：蓝绿色
+        format!("{} {}  \x1b[38;5;117m{}\x1b[0m", bg, indicator, c.display)
+    } else {
+        let trimmed = c.display.trim_end();
+        // 斜杠命令：display 格式 "/cmd           desc"（多空格分隔）
+        if let Some(sep) = trimmed.find("   ") {
+            let cmd_part = trimmed[..sep].trim();
+            let desc_part = trimmed[sep..].trim();
+            format!(
+                "{} {}  \x1b[97m\x1b[1m{:<14}\x1b[0m{}\x1b[38;5;244m {}\x1b[0m",
+                bg, indicator, cmd_part, bg, desc_part
+            )
+        } else {
+            // 普通文件
+            format!("{} {}  \x1b[38;5;255m{}\x1b[0m", bg, indicator, c.display)
+        }
+    }
+}
+
+/// 在终端底部渲染竖向交互式候选列表。
+/// 上下键选择，Enter/Tab 确认，Esc/Ctrl+C 取消。
+fn show_interactive_list(candidates: &[Pair]) -> std::io::Result<Option<String>> {
+    use crossterm::cursor::{MoveTo, position as cursor_pos};
+    use crossterm::event::{read as ev_read, Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::style::Print;
+    use crossterm::terminal::{Clear, ClearType, size as term_size};
+    use crossterm::execute;
+    use std::io::{stdout, Write};
+
+    let (term_w, term_h) = term_size()?;
+    let display_count = candidates.len().min(MAX_COMPLETION_DISPLAY);
+    let extra_line = usize::from(candidates.len() > display_count);
+    // 上分隔线 + 候选行 + 可选 more 行 + 下分隔线
+    let list_height = (display_count + 2 + extra_line) as u16;
+    // 固定到终端底部，不遮挡输入行上方内容
+    let list_start = term_h.saturating_sub(list_height + 1);
+    let mut selected = 0usize;
+    let mut out = stdout();
+    let sep = "─".repeat((term_w as usize).min(54));
+
+    // 记录输入行光标位置
+    let (orig_col, orig_row) = cursor_pos()?;
+
+    // 绘制完整候选列表
+    let draw = |out: &mut std::io::Stdout, sel: usize| -> std::io::Result<()> {
+        execute!(out, MoveTo(0, list_start), Clear(ClearType::CurrentLine))?;
+        execute!(out, Print(format!("\x1b[38;5;244m{}\x1b[0m", sep)))?;
+        for i in 0..display_count {
+            execute!(out, MoveTo(0, list_start + 1 + i as u16), Clear(ClearType::CurrentLine))?;
+            execute!(out, Print(render_one_candidate(&candidates[i], i == sel)))?;
+        }
+        if extra_line > 0 {
+            execute!(out, MoveTo(0, list_start + 1 + display_count as u16), Clear(ClearType::CurrentLine))?;
+            execute!(out, Print(format!(
+                "\x1b[48;5;238m\x1b[38;5;244m    … {} more results\x1b[0m",
+                candidates.len() - display_count
+            )))?;
+        }
+        execute!(out, MoveTo(0, list_start + list_height - 1), Clear(ClearType::CurrentLine))?;
+        execute!(out, Print(format!("\x1b[38;5;244m{}\x1b[0m", sep)))?;
+        execute!(out, MoveTo(orig_col, orig_row))?;
+        out.flush()
+    };
+
+    draw(&mut out, selected)?;
+
+    // 交互循环
+    let result = loop {
+        match ev_read()? {
+            Event::Key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. }) => {
+                let old = selected;
+                selected = if selected == 0 { display_count - 1 } else { selected - 1 };
+                execute!(out,
+                    MoveTo(0, list_start + 1 + old as u16),
+                    Clear(ClearType::CurrentLine),
+                    Print(render_one_candidate(&candidates[old], false))
+                )?;
+                execute!(out,
+                    MoveTo(0, list_start + 1 + selected as u16),
+                    Clear(ClearType::CurrentLine),
+                    Print(render_one_candidate(&candidates[selected], true))
+                )?;
+                execute!(out, MoveTo(orig_col, orig_row))?;
+                out.flush()?;
+            }
+            Event::Key(KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. }) => {
+                let old = selected;
+                selected = (selected + 1) % display_count;
+                execute!(out,
+                    MoveTo(0, list_start + 1 + old as u16),
+                    Clear(ClearType::CurrentLine),
+                    Print(render_one_candidate(&candidates[old], false))
+                )?;
+                execute!(out,
+                    MoveTo(0, list_start + 1 + selected as u16),
+                    Clear(ClearType::CurrentLine),
+                    Print(render_one_candidate(&candidates[selected], true))
+                )?;
+                execute!(out, MoveTo(orig_col, orig_row))?;
+                out.flush()?;
+            }
+            Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, .. })
+            | Event::Key(KeyEvent { code: KeyCode::Tab, modifiers: KeyModifiers::NONE, .. }) => {
+                break Some(candidates[selected].replacement.clone());
+            }
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. })
+            | Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }) => {
+                break None;
+            }
+            _ => {}
+        }
+    };
+
+    // 清除候选列表
+    for i in 0..list_height {
+        execute!(out, MoveTo(0, list_start + i), Clear(ClearType::CurrentLine))?;
+    }
+    execute!(out, MoveTo(orig_col, orig_row))?;
+    out.flush()?;
+
+    Ok(result)
+}
+
+/// Tab 键的交互式补全事件处理器
+struct InteractiveCompleteHandler;
+
+impl rustyline::ConditionalEventHandler for InteractiveCompleteHandler {
+    fn handle(
+        &self,
+        _evt: &rustyline::Event,
+        _n: rustyline::RepeatCount,
+        _positive: bool,
+        ctx: &rustyline::EventContext<'_>,
+    ) -> Option<Cmd> {
+        let line = ctx.line();
+        let pos = ctx.pos();
+        let word = &line[..pos];
+
+        let (candidates, byte_start) = compute_candidates_for_str(word);
+        if candidates.is_empty() {
+            return None; // 无候选，rustyline 默认处理
+        }
+
+        match show_interactive_list(&candidates) {
+            Ok(Some(replacement)) => {
+                // 计算从 byte_start 到当前光标之间的字符数（Unicode 安全）
+                let chars_to_delete = line[byte_start..pos].chars().count();
+                // BackwardChar(n) 向后删除 n 个字符，然后插入 replacement
+                Some(Cmd::Replace(Movement::BackwardChar(chars_to_delete), Some(replacement)))
+            }
+            _ => None,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// crossterm 实时交互式 readline（完全替代 rustyline 的输入读取）
+// 支持：实时候选下拉、输入行下方显示、上下键选择、历史记录、行编辑
+// ─────────────────────────────────────────────
+
+enum ReadLine {
+    Line(String),
+    Interrupted,
+    Eof,
+}
+
+/// 计算字符串中可见字符列数（跳过 ANSI 转义码，正确处理 Unicode 宽字符）
+fn visible_columns(s: &str) -> usize {
+    let mut cols = 0usize;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // 跳过 ANSI 转义序列：\x1b[ ... 字母  或  \x1b 字母
+            if chars.peek() == Some(&'[') {
+                chars.next(); // 消耗 '['
+                // 消耗直到遇到字母（终止符）
+                for inner in chars.by_ref() {
+                    if inner.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                // 简单转义：\x1b + 单个字符
+                chars.next();
+            }
+        } else {
+            // 使用 unicode_width 规则：CJK 等宽字符占 2 列，其余占 1 列
+            // 这里用简单规则：U+2E80..U+9FFF 及部分范围为宽字符
+            let w = unicode_char_width(c);
+            cols += w;
+        }
+    }
+    cols
+}
+
+/// 返回单个 Unicode 字符的终端显示宽度（0、1 或 2）
+fn unicode_char_width(c: char) -> usize {
+    // 控制字符宽度为 0
+    if c < ' ' || c == '\x7f' {
+        return 0;
+    }
+    let cp = c as u32;
+    // 宽字符范围（CJK、全角符号等）
+    if matches!(cp,
+        0x1100..=0x115F  // Hangul Jamo
+        | 0x2E80..=0x303E  // CJK Radicals
+        | 0x3041..=0x33BF  // Hiragana/Katakana/CJK
+        | 0x33FF..=0x33FF
+        | 0x3400..=0x4DBF  // CJK Extension A
+        | 0x4E00..=0x9FFF  // CJK Unified
+        | 0xA000..=0xA4CF  // Yi
+        | 0xAC00..=0xD7AF  // Hangul Syllables
+        | 0xF900..=0xFAFF  // CJK Compatibility
+        | 0xFE10..=0xFE1F  // Vertical Forms
+        | 0xFE30..=0xFE4F  // CJK Compatibility Forms
+        | 0xFF01..=0xFF60  // Fullwidth Forms
+        | 0xFFE0..=0xFFE6  // Fullwidth Signs
+        | 0x1B000..=0x1B0FF // Kana Supplement
+        | 0x1F004..=0x1F0CF
+        | 0x1F200..=0x1F2FF
+        | 0x1F300..=0x1F64F // Misc Symbols & Emoticons
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x2FFFD // CJK Extension B-F
+        | 0x30000..=0x3FFFD
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 将候选项应用到输入行（chars[offset..cursor] 替换为 replacement）
+fn apply_candidate(chars: &mut Vec<char>, cursor: &mut usize, candidate: &Pair, offset: usize) {
+    let rep: Vec<char> = candidate.replacement.chars().collect();
+    chars.drain(offset..*cursor);
+    for (i, &c) in rep.iter().enumerate() {
+        chars.insert(offset + i, c);
+    }
+    *cursor = offset + rep.len();
+}
+
+/// 根据当前输入更新候选列表
+fn update_completion(
+    chars: &[char],
+    cursor: usize,
+    candidates: &mut Vec<Pair>,
+    selected: &mut Option<usize>,
+    offset: &mut usize,
+) {
+    let word: String = chars[..cursor].iter().collect();
+
+    // @ 文件路径补全
+    if let Some(at_pos) = word.rfind('@') {
+        let path_part = &word[at_pos + 1..];
+        let cands = ChatCompleter::complete_path(path_part);
+        if !cands.is_empty() {
+            *candidates = cands;
+            *selected = None;
+            // offset = @ 之后的字符位置
+            *offset = word[..at_pos + 1].chars().count();
+            return;
+        }
+    }
+
+    // / 斜杠：行首才处理
+    if word.starts_with('/') {
+        // 先匹配内置命令
+        let cmd_matches: Vec<Pair> = SLASH_COMMANDS
+            .iter()
+            .filter(|(cmd, _)| cmd.starts_with(word.as_str()))
+            .map(|(cmd, desc)| Pair {
+                display: format!("{:<14} {}", cmd, desc),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        if !cmd_matches.is_empty() {
+            *candidates = cmd_matches;
+            *selected = None;
+            *offset = 0;
+            return;
+        }
+        // 无内置命令匹配 → 文件路径补全
+        let file_cands = ChatCompleter::complete_path(&word);
+        if !file_cands.is_empty() {
+            *candidates = file_cands;
+            *selected = None;
+            *offset = 0;
+            return;
+        }
+    }
+
+    candidates.clear();
+    *selected = None;
+    *offset = 0;
+}
+
+/// 重绘输入行 + 候选列表（在输入行下方）
+/// 返回候选区行数（含上下分隔线）
+/// 计算 chars[..n] 的实际终端显示列数（中文等宽字符占2列）
+fn chars_display_cols(chars: &[char], n: usize) -> usize {
+    chars[..n].iter().map(|&c| unicode_char_width(c)).sum()
+}
+
+fn redraw_input_line(
+    out: &mut std::io::Stdout,
+    prompt: &str,
+    chars: &[char],
+    cursor: usize,
+    candidates: &[Pair],
+    selected: Option<usize>,
+) -> std::io::Result<()> {
+    use crossterm::cursor::MoveToColumn;
+    use crossterm::cursor::MoveUp;
+    use crossterm::style::Print;
+    use crossterm::terminal::{Clear, ClearType, size as term_size};
+    use crossterm::execute;
+
+    let display_count = candidates.len().min(MAX_COMPLETION_DISPLAY);
+    let extra = usize::from(candidates.len() > display_count);
+    let cand_lines = if candidates.is_empty() { 0 } else { display_count + 2 + extra };
+
+    // 从当前位置清除到屏幕底部（清除旧内容）
+    execute!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
+
+    // 打印 prompt + 输入内容
+    execute!(out, Print(prompt))?;
+    let input_str: String = chars.iter().collect();
+    execute!(out, Print(&input_str))?;
+
+    // 候选列表（输入行下方）
+    if !candidates.is_empty() {
+        let term_w = term_size().map(|(w, _)| w as usize).unwrap_or(80);
+        let sep = "─".repeat(term_w.min(54));
+        execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
+        for i in 0..display_count {
+            execute!(out, Print(format!(
+                "\r\n{}",
+                render_one_candidate(&candidates[i], Some(i) == selected)
+            )))?;
+        }
+        if extra > 0 {
+            execute!(out, Print(format!(
+                "\r\n\x1b[48;5;238m\x1b[38;5;244m    … {} more results\x1b[0m",
+                candidates.len() - display_count
+            )))?;
+        }
+        execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
+        // 移回输入行
+        execute!(out, MoveUp(cand_lines as u16))?;
+    }
+
+    // 移到正确的光标列
+    // 注意：cursor 是字符索引，中文等宽字符占2列，必须用 chars_display_cols 计算实际列数
+    let col = (visible_columns(prompt) + chars_display_cols(chars, cursor)) as u16;
+    execute!(out, MoveToColumn(col))?;
+    out.flush()?;
+    Ok(())
+}
+
+/// 交互式读取一行输入（crossterm raw mode）
+/// - 每次字符输入实时更新候选列表
+/// - 候选在输入行下方竖向显示
+/// - ↑↓ 方向键在候选/历史间导航，Tab 确认候选，Enter 提交
+fn interactive_readline(
+    prompt: &str,
+    history: &mut Vec<String>,
+) -> std::io::Result<ReadLine> {
+    use crossterm::cursor::MoveToColumn;
+    use crossterm::event::{read as ev_read, Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::style::Print;
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use crossterm::execute;
+    use std::io::stdout;
+
+    enable_raw_mode()?;
+    let mut out = stdout();
+
+    let mut chars: Vec<char> = Vec::new();
+    let mut cursor: usize = 0;
+    let mut history_idx: Option<usize> = None;
+    let mut history_saved = String::new();
+    let mut candidates: Vec<Pair> = Vec::new();
+    let mut selected: Option<usize> = None;
+    let mut offset: usize = 0; // 候选起始字符偏移
+
+    // 初始渲染 prompt
+    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+
+    let result = loop {
+        let event = match ev_read() {
+            Ok(e) => e,
+            Err(e) => { let _ = disable_raw_mode(); return Err(e); }
+        };
+
+        match event {
+            // ── Ctrl+C 中断 ──
+            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                let _ = execute!(out, Print("\r\n"));
+                break ReadLine::Interrupted;
+            }
+            // ── Ctrl+D EOF（仅在输入为空时） ──
+            Event::Key(KeyEvent { code: KeyCode::Char('d'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                if chars.is_empty() {
+                    let _ = execute!(out, Print("\r\n"));
+                    break ReadLine::Eof;
+                }
+            }
+            // ── Enter 提交 / 确认候选 ──
+            Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, .. }) => {
+                if let Some(idx) = selected {
+                    // 确认选中候选
+                    apply_candidate(&mut chars, &mut cursor, &candidates[idx], offset);
+                    selected = None;
+                    candidates.clear();
+                    offset = 0;
+                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                } else {
+                    // 提交输入
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                    let _ = execute!(out, Print("\r\n"));
+                    let line: String = chars.iter().collect();
+                    break ReadLine::Line(line);
+                }
+            }
+            // ── Tab 选择/确认候选 ──
+            Event::Key(KeyEvent { code: KeyCode::Tab, modifiers: KeyModifiers::NONE, .. }) => {
+                if !candidates.is_empty() {
+                    if let Some(idx) = selected {
+                        // 确认当前选中
+                        apply_candidate(&mut chars, &mut cursor, &candidates[idx], offset);
+                        selected = None;
+                        candidates.clear();
+                        offset = 0;
+                        update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    } else {
+                        selected = Some(0);
+                    }
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                }
+            }
+            // ── Esc 关闭候选 ──
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                if !candidates.is_empty() {
+                    candidates.clear();
+                    selected = None;
+                    offset = 0;
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                }
+            }
+            // ── ↑ 候选上移 / 历史向上 ──
+            Event::Key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. }) => {
+                if !candidates.is_empty() {
+                    let n = candidates.len().min(MAX_COMPLETION_DISPLAY);
+                    selected = Some(match selected {
+                        None | Some(0) => n.saturating_sub(1),
+                        Some(i) => i - 1,
+                    });
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                } else if !history.is_empty() {
+                    if history_idx.is_none() { history_saved = chars.iter().collect(); }
+                    let idx = match history_idx {
+                        None => history.len() - 1,
+                        Some(0) => 0,
+                        Some(i) => i - 1,
+                    };
+                    history_idx = Some(idx);
+                    chars = history[idx].chars().collect();
+                    cursor = chars.len();
+                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                }
+            }
+            // ── ↓ 候选下移 / 历史向下 ──
+            Event::Key(KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. }) => {
+                if !candidates.is_empty() {
+                    let n = candidates.len().min(MAX_COMPLETION_DISPLAY);
+                    selected = Some(match selected {
+                        None => 0,
+                        Some(i) => (i + 1) % n,
+                    });
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                } else if let Some(idx) = history_idx {
+                    if idx + 1 < history.len() {
+                        history_idx = Some(idx + 1);
+                        chars = history[idx + 1].chars().collect();
+                    } else {
+                        history_idx = None;
+                        chars = history_saved.chars().collect();
+                    }
+                    cursor = chars.len();
+                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                }
+            }
+            // ── ← 光标左移 ──
+            Event::Key(KeyEvent { code: KeyCode::Left, modifiers: KeyModifiers::NONE, .. }) => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    let col = (visible_columns(prompt) + chars_display_cols(&chars, cursor)) as u16;
+                    let _ = execute!(out, MoveToColumn(col));
+                    let _ = out.flush();
+                }
+            }
+            // ── → 光标右移 ──
+            Event::Key(KeyEvent { code: KeyCode::Right, modifiers: KeyModifiers::NONE, .. }) => {
+                if cursor < chars.len() {
+                    cursor += 1;
+                    let col = (visible_columns(prompt) + chars_display_cols(&chars, cursor)) as u16;
+                    let _ = execute!(out, MoveToColumn(col));
+                    let _ = out.flush();
+                }
+            }
+            // ── Ctrl+A 行首 ──
+            Event::Key(KeyEvent { code: KeyCode::Char('a'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                cursor = 0;
+                let col = visible_columns(prompt) as u16;
+                let _ = execute!(out, MoveToColumn(col));
+                let _ = out.flush();
+            }
+            // ── Ctrl+E 行尾 ──
+            Event::Key(KeyEvent { code: KeyCode::Char('e'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                cursor = chars.len();
+                let col = (visible_columns(prompt) + chars_display_cols(&chars, cursor)) as u16;
+                let _ = execute!(out, MoveToColumn(col));
+                let _ = out.flush();
+            }
+            // ── Ctrl+U 清除行 ──
+            Event::Key(KeyEvent { code: KeyCode::Char('u'), modifiers: KeyModifiers::CONTROL, .. }) => {
+                chars.clear();
+                cursor = 0;
+                history_idx = None;
+                update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+            }
+            // ── Backspace ──
+            Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => {
+                if cursor > 0 {
+                    cursor -= 1;
+                    chars.remove(cursor);
+                    history_idx = None;
+                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                }
+            }
+            // ── Delete（前向删除） ──
+            Event::Key(KeyEvent { code: KeyCode::Delete, .. }) => {
+                if cursor < chars.len() {
+                    chars.remove(cursor);
+                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                }
+            }
+            // ── 普通字符 ──
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            }) if modifiers == KeyModifiers::NONE || modifiers == KeyModifiers::SHIFT => {
+                chars.insert(cursor, c);
+                cursor += 1;
+                history_idx = None;
+                update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+            }
+            _ => {}
+        }
+    };
+
+    let _ = disable_raw_mode();
+    Ok(result)
+}
 
 // ─────────────────────────────────────────────
 // @ 文件注入：解析消息中的 @path，替换为文件内容
@@ -530,7 +1124,7 @@ pub async fn execute(args: &ChatArgs) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────
-// 欢迎界面（Claude Code 风格）
+// 欢迎界面（Numina 风格）
 // ─────────────────────────────────────────────
 
 fn print_welcome(model: &str, skill_count: usize, session: Option<&str>, interactive: bool) {
@@ -783,44 +1377,60 @@ async fn run_interactive_with_session(
     initial_session: Option<String>,
 ) -> Result<()> {
     let model_override = args.model.as_deref();
-    let mut current_session: Option<String> = initial_session;
+    let mut current_session: Option<String> = initial_session.clone();
     let mut turn_count = 0usize;
 
-    // 初始化 rustyline editor（Tab 补全 + 历史记录）
-    // Circular 模式：Tab 循环选择候选项
-    let rl_config = Config::builder()
-        .completion_type(CompletionType::Circular)
-        .build();
-    let mut rl: Editor<ChatCompleter, _> = Editor::with_config(rl_config)?;
-    rl.set_helper(Some(ChatCompleter::new()));
+    // 初始化累计 token 数：从已有 session 历史读取，保证 context bar 连续显示
+    let mut accumulated_tokens: usize = if let Some(ref sid) = initial_session {
+        ChatEngine::get_session(sid)
+            .map(|s| s.turns.iter().map(|t| t.content.len()).sum::<usize>() / 4)
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    // 加载历史记录（忽略错误）
+    // 加载历史记录（从文件读取到 Vec<String>，用于 interactive_readline）
     let history_path = dirs::home_dir()
         .map(|h| h.join(".numina").join("chat_history"))
         .unwrap_or_else(|| std::path::PathBuf::from(".numina_history"));
-    let _ = rl.load_history(&history_path);
+    let mut chat_history: Vec<String> = if let Ok(content) = std::fs::read_to_string(&history_path) {
+        content.lines().filter(|s| !s.is_empty()).map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
 
     loop {
-        // 使用 rustyline 读取输入（支持 Tab 补全、上下键历史、左右键移动）
-        let prompt = format!("{}{}>{} ", BOLD, GREEN, RESET);
-        let readline = rl.readline(&prompt);
+        // prompt 必须是纯文本（不含 ANSI 转义码），否则 visible_columns()
+        // 计算出的列数会偏大，导致光标停在错误位置（偏左）。
+        // 颜色通过在 readline 之前打印一个空行来保持视觉效果。
+        let prompt = "❯ ";
 
-        let input = match readline {
-            Ok(line) => {
+        let input = match interactive_readline(prompt, &mut chat_history) {
+            Ok(ReadLine::Line(line)) => {
                 let trimmed = line.trim().to_string();
                 if !trimmed.is_empty() {
-                    let _ = rl.add_history_entry(&trimmed);
-                    // 每次输入后立即追加保存，防止强制退出丢失历史
-                    let _ = rl.append_history(&history_path);
+                    chat_history.push(trimmed.clone());
+                    // 追加保存到历史文件，防止强制退出丢失历史
+                    if let Some(parent) = history_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(&history_path)
+                        .and_then(|mut f| {
+                            use std::io::Write;
+                            writeln!(f, "{}", trimmed)
+                        });
                 }
                 trimmed
             }
-            Err(ReadlineError::Interrupted) => {
+            Ok(ReadLine::Interrupted) => {
                 // Ctrl+C：取消当前输入，继续循环
                 println!();
                 continue;
             }
-            Err(ReadlineError::Eof) => {
+            Ok(ReadLine::Eof) => {
                 // Ctrl+D：退出
                 println!();
                 println!("{}Goodbye! 👋{}", DIM, RESET);
@@ -863,6 +1473,7 @@ async fn run_interactive_with_session(
             "/new" => {
                 current_session = None;
                 turn_count = 0;
+                accumulated_tokens = 0; // 新会话重置 context bar
                 clear_last_session_id();
                 println!("{}✅ Started a new session.{}", GREEN, RESET);
                 println!();
@@ -912,132 +1523,170 @@ async fn run_interactive_with_session(
         }
         let input = expanded_input.as_str();
 
-        // 发送消息
-        if args.stream {
-            let (mut rx, sid, sent_tokens, ctx_window) = match engine
-                .chat_stream(input, model_override, current_session.as_deref())
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("\n{}❌ Error: {}{}\n", YELLOW, e, RESET);
-                    continue;
-                }
-            };
+        // 发送消息（使用 ReAct 工具调用模式）
+        match engine
+            .chat_react(input, model_override, current_session.as_deref())
+            .await
+        {
+            Ok((mut rx, sid, sent_tokens, ctx_window)) => {
+                println!();
 
-            println!();
-            print!("{}{}Numina{} ", BOLD, CYAN, RESET);
-            std::io::stdout().flush()?;
-
-            // 流式接收：\x00R 前缀 = reasoning（暗灰色思考过程），\x00C 前缀 = content（正常回答）
-            let mut full_response = String::new();  // 只保存 content 部分
-            let mut in_reasoning = false;
-            let mut reasoning_started = false;
-            // 代码块渲染状态
-            let mut in_code_block = false;
-            let mut line_buf = String::new(); // 行缓冲，用于检测 ``` 标记
-            while let Some(token) = rx.recv().await {
-                if let Some(text) = token.strip_prefix("\x00R") {
-                    // 思考过程：暗灰色显示
-                    if !reasoning_started {
-                        print!("{}{}[thinking] ", DIM, GRAY);
-                        reasoning_started = true;
-                        in_reasoning = true;
+                // 等待动画：在模型思考时显示旋转动画
+                // 用一个 flag channel 通知动画停止
+                let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+                let spinner_handle = tokio::spawn(async move {
+                    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                    let mut i = 0usize;
+                    loop {
+                        // 检查是否需要停止
+                        if stop_rx.try_recv().is_ok() {
+                            // 清除动画行
+                            print!("\r\x1b[2K");
+                            std::io::stdout().flush().ok();
+                            break;
+                        }
+                        print!("\r  \x1b[36m{}\x1b[0m \x1b[2mthinking…\x1b[0m", frames[i % frames.len()]);
+                        std::io::stdout().flush().ok();
+                        i += 1;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
                     }
-                    print!("{}", text);
-                    std::io::stdout().flush()?;
-                } else if let Some(text) = token.strip_prefix("\x00C") {
-                    // 正常回答：如果之前有思考过程，先换行重置颜色
-                    if in_reasoning {
-                        println!("{}", RESET);
+                });
+
+                let mut full_response = String::new();
+                let mut in_code_block = false;
+                let mut line_buf = String::new();
+                let mut stop_tx_opt = Some(stop_tx);
+                // 用于在工具执行完毕后重新启动 thinking 动画（用 abort 停止）
+                let mut thinking_task: Option<tokio::task::JoinHandle<()>> = None;
+
+                // 停止当前 thinking 动画的辅助闭包（inline）
+                macro_rules! stop_thinking {
+                    () => {
+                        if let Some(h) = thinking_task.take() {
+                            h.abort();
+                            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                            print!("\r\x1b[2K");
+                            std::io::stdout().flush().ok();
+                        }
+                    };
+                }
+
+                while let Some(event) = rx.recv().await {
+                    // 收到第一个事件时停止初始动画（只发送一次）
+                    if let Some(tx) = stop_tx_opt.take() {
+                        let _ = tx.send(());
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                        print!("\r\x1b[2K");
+                        std::io::stdout().flush().ok();
+                    }
+
+                    if event == "\x00D" {
+                        // 完成信号：停止任何残留的 thinking 动画
+                        stop_thinking!();
+                        break;
+                    } else if event == "\x00W" {
+                        // 工具执行完毕，等待模型下一轮响应：重新显示 thinking 动画
+                        // 先停止旧的（如果有）
+                        stop_thinking!();
+                        // 启动新的 thinking 动画（用 abort 停止，不需要 channel）
+                        let h = tokio::spawn(async {
+                            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                            let mut i = 0usize;
+                            loop {
+                                print!("\r  \x1b[36m{}\x1b[0m \x1b[2mthinking…\x1b[0m", frames[i % frames.len()]);
+                                std::io::stdout().flush().ok();
+                                i += 1;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                            }
+                        });
+                        thinking_task = Some(h);
+                    } else if let Some(tool_info) = event.strip_prefix("\x00T") {
+                        // 停止 thinking 动画（如果有）
+                        stop_thinking!();
+                        // 工具调用事件：格式 "tool_name|params_preview"
+                        let parts: Vec<&str> = tool_info.splitn(2, '|').collect();
+                        let tool_name = parts.first().copied().unwrap_or("?");
+                        let params = parts.get(1).copied().unwrap_or("");
+                        println!();
+                        if params.is_empty() {
+                            println!("  {}🔧 {}{}{}…{}", GRAY, BOLD, tool_name, RESET, RESET);
+                        } else {
+                            println!("  {}🔧 {}{}{} {}{}{}",
+                                GRAY, BOLD, tool_name, RESET,
+                                DIM, params, RESET);
+                        }
+                        std::io::stdout().flush()?;
+                    } else if let Some(result) = event.strip_prefix("\x00R") {
+                        // 工具结果事件
+                        let preview: String = result.chars().take(300).collect();
+                        let ellipsis = if result.len() > 300 { "…" } else { "" };
+                        println!("  {}┌─ result{}", GRAY, RESET);
+                        for line in preview.lines() {
+                            println!("  {}│{} {}", GRAY, RESET, line);
+                        }
+                        if !ellipsis.is_empty() {
+                            println!("  {}│ (truncated…){}", GRAY, RESET);
+                        }
+                        println!("  {}└─{}", GRAY, RESET);
                         println!();
                         print!("{}{}Numina{} ", BOLD, CYAN, RESET);
-                        in_reasoning = false;
-                    }
-                    // 代码块检测：逐字符处理，检测换行时判断是否有 ``` 标记
-                    for ch in text.chars() {
-                        line_buf.push(ch);
-                        if ch == '\n' {
-                            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-                            if trimmed.starts_with("```") {
-                                if in_code_block {
-                                    // 结束代码块：打印关闭行 + 重置背景
+                        std::io::stdout().flush()?;
+                    } else if let Some(text) = event.strip_prefix("\x00C") {
+                        // 普通文本输出（带代码块渲染）
+                        for ch in text.chars() {
+                            line_buf.push(ch);
+                            if ch == '\n' {
+                                let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+                                if trimmed.starts_with("```") {
+                                    if in_code_block {
+                                        print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                        in_code_block = false;
+                                    } else {
+                                        in_code_block = true;
+                                        print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                    }
+                                } else if in_code_block {
                                     print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
-                                    in_code_block = false;
                                 } else {
-                                    // 开始代码块：打印开启行 + 设置背景
-                                    in_code_block = true;
-                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                    print!("{}\n", trimmed);
                                 }
-                            } else if in_code_block {
-                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                std::io::stdout().flush()?;
+                                line_buf.clear();
+                            }
+                        }
+                        if !line_buf.is_empty() {
+                            if in_code_block {
+                                print!("{}{}{}", CODE_BG, CODE_FG, line_buf);
                             } else {
-                                print!("{}\n", trimmed);
+                                print!("{}", line_buf);
                             }
                             std::io::stdout().flush()?;
                             line_buf.clear();
                         }
+                        full_response.push_str(text);
                     }
-                    // 打印行缓冲中未换行的部分
-                    if !line_buf.is_empty() {
-                        if in_code_block {
-                            print!("{}{}{}", CODE_BG, CODE_FG, line_buf);
-                        } else {
-                            print!("{}", line_buf);
-                        }
-                        std::io::stdout().flush()?;
-                        line_buf.clear();
-                    }
-                    full_response.push_str(text);
-                } else {
-                    // 兼容无前缀的 token（其他 provider）
-                    print!("{}", token);
-                    std::io::stdout().flush()?;
-                    full_response.push_str(&token);
                 }
-            }
-            if in_code_block {
-                print!("{}", RESET); // 确保代码块颜色被重置
-            }
-            if in_reasoning {
-                print!("{}", RESET);
-            }
-            println!();
-            println!();
 
-            let used_tokens = sent_tokens + full_response.len() / 4;
-            print_context_bar(used_tokens, ctx_window);
-
-            if let Err(e) = ChatEngine::append_assistant_turn(&sid, &full_response) {
-                eprintln!("{}⚠️  Failed to save session: {}{}", YELLOW, e, RESET);
-            }
-
-            current_session = Some(sid.clone());
-            save_last_session_id(&sid);
-        } else {
-            match engine
-                .chat_once(input, model_override, current_session.as_deref())
-                .await
-            {
-                Ok((reply, sid, used_tokens, ctx_window)) => {
-                    println!();
-                    println!("{}{}Numina{} {}", BOLD, CYAN, RESET, reply);
-                    println!();
-
-                    print_context_bar(used_tokens, ctx_window);
-
-                    current_session = Some(sid.clone());
-                    save_last_session_id(&sid);
+                if in_code_block {
+                    print!("{}", RESET);
                 }
-                Err(e) => {
-                    eprintln!("\n{}❌ Error: {}{}\n", YELLOW, e, RESET);
-                }
+                println!();
+                println!();
+
+                // 本轮新增 token 数（发送 + 回复）
+                let this_turn_tokens = sent_tokens + full_response.len() / 4;
+                // 累加到历史总量（保证 context bar 连续递增，不从 0 重置）
+                accumulated_tokens += this_turn_tokens;
+                print_context_bar(accumulated_tokens, ctx_window);
+
+                current_session = Some(sid.clone());
+                save_last_session_id(&sid);
+            }
+            Err(e) => {
+                eprintln!("\n{}❌ Error: {}{}\n", YELLOW, e, RESET);
             }
         }
     }
-
-    // 保存历史记录
-    let _ = rl.save_history(&history_path);
 
     Ok(())
 }

@@ -171,15 +171,58 @@ impl OpenAIProvider {
     }
 
     /// 将通用 Message 列表转换为 OpenAI 格式
+    /// 正确处理三种消息类型：
+    /// 1. 普通消息（system/user/assistant）：content 字段
+    /// 2. Assistant 工具调用消息：tool_calls 字段（content 可为 null）
+    /// 3. Tool 结果消息：role=tool + tool_call_id + name + content
     fn convert_messages(messages: &[Message]) -> Vec<OpenAIMessage> {
         messages
             .iter()
-            .map(|m| OpenAIMessage {
-                role: Self::role_str(&m.role).to_string(),
-                content: Some(m.content.clone()),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
+            .map(|m| {
+                match m.role {
+                    Role::Tool => {
+                        // Tool 结果消息：必须有 tool_call_id
+                        OpenAIMessage {
+                            role: "tool".to_string(),
+                            content: Some(m.content.clone()),
+                            tool_calls: None,
+                            tool_call_id: m.tool_call_id.clone(),
+                            name: m.tool_name.clone(),
+                        }
+                    }
+                    Role::Assistant if !m.tool_calls.is_empty() => {
+                        // Assistant 工具调用消息：包含 tool_calls 字段
+                        let oai_tool_calls: Vec<OpenAIToolCallOut> = m.tool_calls.iter().map(|tc| {
+                            OpenAIToolCallOut {
+                                id: tc.id.clone(),
+                                call_type: "function".to_string(),
+                                function: OpenAIFunctionCall {
+                                    name: tc.name.clone(),
+                                    arguments: serde_json::to_string(&tc.arguments)
+                                        .unwrap_or_else(|_| "{}".to_string()),
+                                },
+                            }
+                        }).collect();
+                        OpenAIMessage {
+                            role: "assistant".to_string(),
+                            // content 可以为 null（OpenAI 规范允许）
+                            content: if m.content.is_empty() { None } else { Some(m.content.clone()) },
+                            tool_calls: Some(oai_tool_calls),
+                            tool_call_id: None,
+                            name: None,
+                        }
+                    }
+                    _ => {
+                        // 普通消息
+                        OpenAIMessage {
+                            role: Self::role_str(&m.role).to_string(),
+                            content: Some(m.content.clone()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            name: None,
+                        }
+                    }
+                }
             })
             .collect()
     }
