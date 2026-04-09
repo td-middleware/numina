@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Subcommand;
 
 pub mod chat;
+pub mod session;
 pub mod plan;
 pub mod agent;
 pub mod model;
