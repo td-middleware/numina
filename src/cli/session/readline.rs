@@ -162,7 +162,32 @@ fn render_one_candidate(c: &Pair, selected: bool) -> String {
     }
 }
 
+/// 判断输入是否为"大输入"（多行或超长），返回缩略显示字符串
+/// 如果是大输入，返回 Some(缩略文本)；否则返回 None（正常显示）
+fn large_input_summary(chars: &[char]) -> Option<String> {
+    // 超过 120 字符或包含换行符视为大输入
+    const LARGE_THRESHOLD: usize = 120;
+    let has_newline = chars.iter().any(|&c| c == '\n');
+    if chars.len() <= LARGE_THRESHOLD && !has_newline {
+        return None;
+    }
+    let line_count = chars.iter().filter(|&&c| c == '\n').count() + 1;
+    let char_count = chars.len();
+    if line_count > 1 {
+        Some(format!(
+            "\x1b[48;5;238m\x1b[38;5;117m [Pasted text +{} lines, {} chars] \x1b[0m",
+            line_count, char_count
+        ))
+    } else {
+        Some(format!(
+            "\x1b[48;5;238m\x1b[38;5;117m [Long input: {} chars] \x1b[0m",
+            char_count
+        ))
+    }
+}
+
 /// 重绘输入行 + 候选列表（在输入行下方）
+/// 长文本/多行文本自动显示缩略信息，避免终端折行混乱
 fn redraw_input_line(
     out: &mut std::io::Stdout,
     prompt: &str,
@@ -184,31 +209,41 @@ fn redraw_input_line(
     execute!(out, MoveToColumn(0), Clear(ClearType::FromCursorDown))?;
 
     execute!(out, Print(prompt))?;
-    let input_str: String = chars.iter().collect();
-    execute!(out, Print(&input_str))?;
 
-    if !candidates.is_empty() {
-        let term_w = term_size().map(|(w, _)| w as usize).unwrap_or(80);
-        let sep = "─".repeat(term_w.min(54));
-        execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
-        for i in 0..display_count {
-            execute!(out, Print(format!(
-                "\r\n{}",
-                render_one_candidate(&candidates[i], Some(i) == selected)
-            )))?;
+    // 大输入模式：显示缩略信息而非完整内容
+    if let Some(summary) = large_input_summary(chars) {
+        execute!(out, Print(&summary))?;
+        // 光标固定在缩略信息末尾（不计算实际位置）
+        let col = (visible_columns(prompt) + 1) as u16;
+        execute!(out, MoveToColumn(col))?;
+    } else {
+        let input_str: String = chars.iter().collect();
+        execute!(out, Print(&input_str))?;
+
+        if !candidates.is_empty() {
+            let term_w = term_size().map(|(w, _)| w as usize).unwrap_or(80);
+            let sep = "─".repeat(term_w.min(54));
+            execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
+            for i in 0..display_count {
+                execute!(out, Print(format!(
+                    "\r\n{}",
+                    render_one_candidate(&candidates[i], Some(i) == selected)
+                )))?;
+            }
+            if extra > 0 {
+                execute!(out, Print(format!(
+                    "\r\n\x1b[48;5;238m\x1b[38;5;244m    … {} more results\x1b[0m",
+                    candidates.len() - display_count
+                )))?;
+            }
+            execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
+            execute!(out, MoveUp(cand_lines as u16))?;
         }
-        if extra > 0 {
-            execute!(out, Print(format!(
-                "\r\n\x1b[48;5;238m\x1b[38;5;244m    … {} more results\x1b[0m",
-                candidates.len() - display_count
-            )))?;
-        }
-        execute!(out, Print(format!("\r\n\x1b[38;5;244m{}\x1b[0m", sep)))?;
-        execute!(out, MoveUp(cand_lines as u16))?;
+
+        let col = (visible_columns(prompt) + chars_display_cols(chars, cursor)) as u16;
+        execute!(out, MoveToColumn(col))?;
     }
 
-    let col = (visible_columns(prompt) + chars_display_cols(chars, cursor)) as u16;
-    execute!(out, MoveToColumn(col))?;
     out.flush()?;
     Ok(())
 }
@@ -366,6 +401,16 @@ pub fn interactive_readline(
                     selected = None;
                     candidates.clear();
                     offset = 0;
+                    // 如果 apply 后的内容是完整的斜杠命令（精确匹配），直接提交
+                    let line: String = chars.iter().collect();
+                    let is_exact_cmd = super::completer::SLASH_COMMANDS
+                        .iter()
+                        .any(|(cmd, _)| *cmd == line.as_str());
+                    if is_exact_cmd {
+                        let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                        let _ = execute!(out, Print("\r\n"));
+                        break ReadLine::Line(line);
+                    }
                     update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
                     let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
                 } else {
@@ -512,6 +557,16 @@ pub fn interactive_readline(
                 cursor += 1;
                 history_idx = None;
                 update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                // 如果当前输入已经是精确匹配的命令，不显示补全列表（避免上下键被补全捕获）
+                let line: String = chars.iter().collect();
+                let is_exact_cmd = super::completer::SLASH_COMMANDS
+                    .iter()
+                    .any(|(cmd, _)| *cmd == line.as_str());
+                if is_exact_cmd {
+                    candidates.clear();
+                    selected = None;
+                    offset = 0;
+                }
                 let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
             }
             _ => {}

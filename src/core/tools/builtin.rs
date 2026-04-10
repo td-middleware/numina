@@ -669,6 +669,114 @@ impl ToolExecutor for HttpGetTool {
 }
 
 // ─────────────────────────────────────────────
+// http_post — 发起 HTTP POST 请求（支持 MCP JSON-RPC）
+// ─────────────────────────────────────────────
+
+pub struct HttpPostTool;
+
+#[async_trait]
+impl ToolExecutor for HttpPostTool {
+    async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let url = params["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("http_post: missing 'url' parameter"))?;
+        let max_bytes = params["max_bytes"].as_u64().unwrap_or(32768) as usize;
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("Numina-Agent/0.1")
+            .build()
+            .map_err(|e| anyhow::anyhow!("http_post: failed to build client: {}", e))?;
+
+        // 构建请求
+        let mut req = client.post(url);
+
+        // 设置 Content-Type（默认 application/json）
+        let content_type = params["content_type"]
+            .as_str()
+            .unwrap_or("application/json");
+        req = req.header("Content-Type", content_type);
+
+        // 设置自定义 headers
+        if let Some(headers) = params["headers"].as_object() {
+            for (k, v) in headers {
+                if let Some(vs) = v.as_str() {
+                    req = req.header(k.as_str(), vs);
+                }
+            }
+        }
+
+        // 设置请求体
+        let body_str = if params["body"].is_null() || !params.get("body").is_some() {
+            String::new()
+        } else if params["body"].is_string() {
+            params["body"].as_str().unwrap_or("").to_string()
+        } else {
+            serde_json::to_string(&params["body"]).unwrap_or_default()
+        };
+
+        if !body_str.is_empty() {
+            req = req.body(body_str);
+        }
+
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let resp_content_type = resp
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let body = resp.text().await.unwrap_or_default();
+                let truncated = body.len() > max_bytes;
+                let content: String = body.chars().take(max_bytes).collect();
+
+                Ok(ToolResult {
+                    success: status < 400,
+                    data: json!({
+                        "content": content,
+                        "status": status,
+                        "url": url,
+                        "truncated": truncated,
+                        "content_type": resp_content_type,
+                    }),
+                    error: if status >= 400 {
+                        Some(format!("HTTP {} for {}", status, url))
+                    } else {
+                        None
+                    },
+                })
+            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                data: json!(null),
+                error: Some(format!("http_post failed for '{}': {}", url, e)),
+            }),
+        }
+    }
+
+    fn name(&self) -> &str { "http_post" }
+    fn description(&self) -> &str {
+        "Make an HTTP POST request and return the response. Use this for APIs, MCP servers (JSON-RPC over POST), webhooks, etc. Parameters: {\"url\": \"<url>\", \"body\": <json_or_string>, \"headers\": {\"key\": \"value\"}, \"content_type\": \"application/json\", \"max_bytes\": <optional>}"
+    }
+    fn schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "The URL to POST to" },
+                "body": { "description": "Request body (JSON object or string). For MCP JSON-RPC: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tool_name\",\"arguments\":{...}}}" },
+                "headers": { "type": "object", "description": "Additional HTTP headers as key-value pairs" },
+                "content_type": { "type": "string", "description": "Content-Type header (default: application/json)" },
+                "max_bytes": { "type": "integer", "description": "Maximum response body size in bytes (default: 32768)" }
+            },
+            "required": ["url"]
+        })
+    }
+}
+
+// ─────────────────────────────────────────────
 // task_complete — 标记任务完成
 // ─────────────────────────────────────────────
 
@@ -757,6 +865,7 @@ pub fn default_registry() -> ToolRegistry {
     let _ = registry.register(Arc::new(SearchCodeTool));
     let _ = registry.register(Arc::new(FindFilesTool));
     let _ = registry.register(Arc::new(HttpGetTool));
+    let _ = registry.register(Arc::new(HttpPostTool));
     let _ = registry.register(Arc::new(TaskCompleteTool));
     registry
 }

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::RefCell;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -23,6 +24,34 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear",    "清屏"),
     ("/quit",     "退出 Numina"),
 ];
+
+// 线程局部变量：存储动态加载的 skill 名称和描述
+thread_local! {
+    static SKILL_COMMANDS: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
+}
+
+/// 注册已加载的 skills 到补全器（在 ChatEngine 初始化后调用）
+pub fn register_skill_completions(skills: Vec<(String, String)>) {
+    SKILL_COMMANDS.with(|sc| {
+        *sc.borrow_mut() = skills;
+    });
+}
+
+/// 获取所有斜杠命令（内置 + 动态 skills）
+fn all_slash_commands() -> Vec<(String, String)> {
+    let mut cmds: Vec<(String, String)> = SLASH_COMMANDS
+        .iter()
+        .map(|(cmd, desc)| (cmd.to_string(), desc.to_string()))
+        .collect();
+
+    SKILL_COMMANDS.with(|sc| {
+        for (name, desc) in sc.borrow().iter() {
+            cmds.push((format!("/{}", name), desc.clone()));
+        }
+    });
+
+    cmds
+}
 
 // 补全列表背景色（深蓝灰，区别于聊天背景）
 const COMPLETION_BG: &str = "\x1b[48;5;238m";
@@ -137,15 +166,16 @@ impl Completer for ChatCompleter {
             return Ok((at_pos + 1, candidates));
         }
 
-        // / 斜杠处理：行首 / 时优先匹配内置命令，无匹配则回退到绝对路径文件补全
+        // / 斜杠处理：行首 / 时优先匹配内置命令 + skills，无匹配则回退到绝对路径文件补全
         if word.starts_with('/') {
-            let cmd_matches: Vec<Pair> = SLASH_COMMANDS
+            let all_cmds = all_slash_commands();
+            let cmd_matches: Vec<Pair> = all_cmds
                 .iter()
                 .filter(|(cmd, _)| cmd.starts_with(word))
                 .map(|(cmd, desc)| Pair {
                     // display：纯文本，highlight_candidate 会加颜色
-                    display: format!("{:<14} {}", cmd, desc),
-                    replacement: cmd.to_string(),
+                    display: format!("{:<20} {}", cmd, desc),
+                    replacement: cmd.clone(),
                 })
                 .collect();
 
@@ -240,14 +270,15 @@ pub fn compute_candidates_for_str(word: &str) -> (Vec<Pair>, usize) {
         let candidates = ChatCompleter::complete_path(path_part);
         return (candidates, at_pos + 1);
     }
-    // / 斜杠命令或绝对路径补全
+    // / 斜杠命令或绝对路径补全（包含动态 skills）
     if word.starts_with('/') {
-        let cmd_matches: Vec<Pair> = SLASH_COMMANDS
+        let all_cmds = all_slash_commands();
+        let cmd_matches: Vec<Pair> = all_cmds
             .iter()
             .filter(|(cmd, _)| cmd.starts_with(word))
             .map(|(cmd, desc)| Pair {
-                display: format!("{:<14} {}", cmd, desc),
-                replacement: cmd.to_string(),
+                display: format!("{:<20} {}", cmd, desc),
+                replacement: cmd.clone(),
             })
             .collect();
         if !cmd_matches.is_empty() {

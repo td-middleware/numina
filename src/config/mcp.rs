@@ -60,16 +60,54 @@ impl McpConfig {
     }
 
     /// 加载配置文件，不存在则返回默认空配置
+    /// 支持多种格式（按优先级）：
+    /// 1. VSCode 格式: { "mcp_servers": { "name": { "type": "http", "url": "...", "headers": {...} } } }
+    /// 2. VSCode 格式: { "mcpServers": { "name": { "command": "...", "args": [...] } } }
+    /// 3. Numina 格式: { "servers": [...] }
     pub fn load() -> Result<Self> {
         let path = Self::config_path()?;
-        if path.exists() {
-            let content = std::fs::read_to_string(&path)?;
-            let config: Self = serde_json::from_str(&content)
-                .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
-            Ok(config)
-        } else {
-            Ok(Self::default())
+        if !path.exists() {
+            return Ok(Self::default());
         }
+
+        let content = std::fs::read_to_string(&path)?;
+        let json: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", path.display(), e))?;
+
+        // 优先检查 mcp_servers（下划线格式，用户配置的格式）
+        if let Some(mcp_servers) = json.get("mcp_servers").and_then(|v| v.as_object()) {
+            let mut config = Self::default();
+            let (added, _updated, _skipped) =
+                config.merge_from_vscode_format(mcp_servers, true)?;
+            tracing::debug!("Loaded {} MCP servers from mcp_servers format", added);
+            return Ok(config);
+        }
+
+        // 检查 mcpServers（驼峰格式，Claude Desktop / VSCode 标准格式）
+        if let Some(mcp_servers) = json.get("mcpServers").and_then(|v| v.as_object()) {
+            let mut config = Self::default();
+            let (added, _updated, _skipped) =
+                config.merge_from_vscode_format(mcp_servers, true)?;
+            tracing::debug!("Loaded {} MCP servers from mcpServers format", added);
+            return Ok(config);
+        }
+
+        // 检查 Numina 原生格式（servers 数组非空）
+        if let Some(servers) = json.get("servers").and_then(|v| v.as_array()) {
+            if !servers.is_empty() {
+                if let Ok(config) = serde_json::from_value::<Self>(json.clone()) {
+                    return Ok(config);
+                }
+            }
+        }
+
+        // 最后尝试直接反序列化（兼容旧格式）
+        if let Ok(config) = serde_json::from_value::<Self>(json) {
+            return Ok(config);
+        }
+
+        tracing::warn!("Unknown MCP config format in {}, using empty config", path.display());
+        Ok(Self::default())
     }
 
     /// 保存配置文件
@@ -133,6 +171,9 @@ impl McpConfig {
 }
 
 /// 解析单个 VSCode-style server 条目
+/// 支持两种格式：
+/// - 格式1: { "command": "...", "args": [...], "env": {...} }
+/// - 格式2: { "type": "http", "url": "...", "headers": {...} }
 pub fn parse_vscode_server_entry(
     name: &str,
     val: &serde_json::Value,
@@ -141,7 +182,42 @@ pub fn parse_vscode_server_entry(
         anyhow::anyhow!("MCP server '{}' config must be an object", name)
     })?;
 
-    // 判断类型：有 "command" → stdio，有 "url" → http/websocket
+    // 优先检查 format 2: type + url + headers
+    if let (Some(type_val), Some(url_val)) = (obj.get("type"), obj.get("url")) {
+        let server_type = type_val.as_str().unwrap_or("http").to_string();
+        let url = url_val.as_str().ok_or_else(|| {
+            anyhow::anyhow!("MCP server '{}' url must be a string", name)
+        })?;
+
+        // headers → env (key=value 格式)
+        let env: Vec<String> = obj
+            .get("headers")
+            .and_then(|v| v.as_object())
+            .map(|headers| {
+                headers
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, v.as_str().unwrap_or("")))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let description = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        return Ok(McpServerEntry {
+            name: name.to_string(),
+            server_type,
+            command_or_url: url.to_string(),
+            args: None,
+            enabled: true,
+            description,
+            env,
+        });
+    }
+
+    // 回退到 format 1: command + args + env
     let (server_type, command_or_url) =
         if let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) {
             ("stdio".to_string(), cmd.to_string())

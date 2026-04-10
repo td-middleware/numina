@@ -26,6 +26,7 @@ use crate::core::models::provider::StopReason;
 // ─────────────────────────────────────────────
 
 /// 生成工具调用的参数预览字符串（用于 UI 显示）
+/// 返回格式化后的参数字符串，供 runner.rs 渲染
 fn tool_call_preview(tool_call: &crate::core::models::provider::ToolCall) -> String {
     match tool_call.name.as_str() {
         "shell" => tool_call.arguments["command"]
@@ -54,23 +55,33 @@ fn tool_call_preview(tool_call: &crate::core::models::provider::ToolCall) -> Str
             .as_str()
             .unwrap_or("")
             .to_string(),
+        "http_post" => {
+            // 展示 URL + 请求体 JSON（格式化）
+            let url = tool_call.arguments["url"].as_str().unwrap_or("");
+            // 返回完整 JSON 供 UI 格式化展示，前缀 URL 用 \x01 分隔
+            let body_json = serde_json::to_string_pretty(&tool_call.arguments)
+                .unwrap_or_default();
+            format!("{}\x01{}", url, body_json)
+        }
         _ => {
-            let s = serde_json::to_string(&tool_call.arguments).unwrap_or_default();
-            s.chars().take(80).collect()
+            // 其他工具：返回格式化 JSON 供 UI 展示
+            serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_default()
         }
     }
 }
 
 /// 截断工具结果（防止超出模型 token 限制）
-fn truncate_tool_result(result: &str, max_chars: usize) -> String {
-    if result.len() <= max_chars {
+/// UI 层会折叠显示，这里只在极端情况下截断（超过 200k 字符）
+fn truncate_tool_result(result: &str, _max_chars: usize) -> String {
+    const HARD_LIMIT: usize = 200_000;
+    if result.len() <= HARD_LIMIT {
         result.to_string()
     } else {
-        // 在字符边界截断（避免 UTF-8 截断问题）
-        let truncated: String = result.chars().take(max_chars).collect();
+        let truncated: String = result.chars().take(HARD_LIMIT).collect();
         format!(
-            "{}\n\n[... truncated, {} chars total. Use more specific parameters to get focused results.]",
+            "{}\n\n[... truncated at {} chars (hard limit). Result was {} chars total.]",
             truncated,
+            HARD_LIMIT,
             result.len()
         )
     }
@@ -253,15 +264,10 @@ impl ChatEngine {
             "Be concise, accurate, and helpful. When writing code, prefer idiomatic patterns.".to_string(),
         ];
 
-        let skills = self.skill_manager.skills();
-        if !skills.is_empty() {
-            parts.push("\n## Available Skills\n".to_string());
-            for skill in skills {
-                parts.push(format!("### {}\n{}", skill.name, skill.description));
-                if !skill.examples.is_empty() {
-                    parts.push(format!("Examples: {}", skill.examples.join(", ")));
-                }
-            }
+        let skills_block = self.skill_manager.system_prompt_block();
+        if !skills_block.is_empty() {
+            parts.push(String::new());
+            parts.push(skills_block);
         }
 
         parts.join("\n")
@@ -539,21 +545,34 @@ impl ChatEngine {
         tokio::spawn(async move {
             // 参考实现：MAX_ITERATIONS 防止无限循环
             const MAX_ITERATIONS: usize = 15;
-            const MAX_TOOL_RESULT_CHARS: usize = 8000;
+            const MAX_TOOL_RESULT_CHARS: usize = 20000;
 
             // 需要权限确认的工具名集合
             const NEEDS_PERMISSION: &[&str] = &["shell", "write_file", "edit_file"];
 
             let mut full_reply = String::new();
             let mut iterations = 0usize;
+            // 是否已注入"强制汇总"消息（只注入一次）
+            let mut forced_summary = false;
 
             loop {
                 iterations += 1;
                 if iterations > MAX_ITERATIONS {
-                    let _ = tx.send(format!(
-                        "\x00C⚠️ Agent loop exceeded {} iterations. Stopping.",
-                        MAX_ITERATIONS
-                    )).await;
+                    // 超过最大迭代次数：强制注入一条 user 消息要求 AI 汇总，再调用一次模型
+                    if !forced_summary {
+                        forced_summary = true;
+                        messages.push(Message::new(
+                            Role::User,
+                            "You have used many tool calls. Please STOP calling tools now and provide a complete summary of everything you have found so far. Do NOT call any more tools.".to_string(),
+                        ));
+                        // 重置计数，给 AI 最后一次机会输出汇总
+                        iterations = 0;
+                        continue;
+                    }
+                    // 已经强制汇总过了还没结束，直接退出
+                    let _ = tx.send(
+                        "\x00C⚠️ Agent loop exceeded maximum iterations. Stopping.".to_string()
+                    ).await;
                     break;
                 }
 
@@ -767,7 +786,8 @@ If you previously said you couldn't execute commands, IGNORE that — you CAN an
 - list_dir: List directory contents\n\
 - search_code: Search code with grep\n\
 - find_files: Find files by pattern\n\
-- http_get: Make HTTP requests\n\
+- http_get: Make HTTP GET requests\n\
+- http_post: Make HTTP POST requests (use for MCP servers, REST APIs, JSON-RPC — MCP protocol requires POST not GET)\n\
 - task_complete: Signal task completion\n\
 \n\
 ## MANDATORY Tool Usage Rules\n\
@@ -795,6 +815,36 @@ Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
                 parts.push(format!("### {}\n{}", skill.name, skill.description));
             }
         }
+
+        // 注入 MCP 服务器配置（HTTP 类型），让 AI 第一次调用时就带上正确的 headers
+        if let Ok(mcp_cfg) = crate::config::mcp::McpConfig::load() {
+            let http_servers: Vec<_> = mcp_cfg.servers.iter()
+                .filter(|s| s.enabled && (s.server_type == "http" || s.server_type == "websocket"))
+                .collect();
+            if !http_servers.is_empty() {
+                let mut mcp_block = "\n## MCP Servers (HTTP)\n\
+                    IMPORTANT: When calling any of these MCP servers via http_post, you MUST include\n\
+                    the required headers listed below on the FIRST request. Do NOT attempt without headers first.\n".to_string();
+                for srv in &http_servers {
+                    mcp_block.push_str(&format!("\n### {}\n- URL: {}\n", srv.name, srv.command_or_url));
+                    if let Some(desc) = &srv.description {
+                        mcp_block.push_str(&format!("- Description: {}\n", desc));
+                    }
+                    // env 字段存储 headers（key=value 格式）
+                    if !srv.env.is_empty() {
+                        mcp_block.push_str("- Required Headers:\n");
+                        for kv in &srv.env {
+                            if let Some((k, v)) = kv.split_once('=') {
+                                mcp_block.push_str(&format!("  - {}: {}\n", k, v));
+                            }
+                        }
+                    }
+                }
+                mcp_block.push_str("\nAlways include ALL required headers when calling these servers.");
+                parts.push(mcp_block);
+            }
+        }
+
         parts.join("\n")
     }
 
@@ -833,7 +883,23 @@ Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
 
     /// 返回当前加载的 skills 数量
     pub fn skill_count(&self) -> usize {
-        self.skill_manager.skills().len()
+        self.skill_manager.count()
+    }
+
+    /// 检查输入是否是一个 skill 调用，返回展开后的 prompt
+    pub fn expand_skill_command(&self, input: &str) -> Option<String> {
+        self.skill_manager
+            .match_slash_command(input)
+            .map(|(skill, args)| skill.expand_prompt(&args))
+    }
+
+    /// 返回所有已加载 skill 的名称和描述（用于补全）
+    pub fn skill_names(&self) -> Vec<(String, String)> {
+        self.skill_manager
+            .skills()
+            .iter()
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect()
     }
 
     /// 返回当前使用的模型名

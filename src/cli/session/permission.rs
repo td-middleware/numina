@@ -46,7 +46,7 @@ pub fn read_permission_choice_interactive(tool_name: &str, cmd: &str) -> u8 {
     const OPTIONS: &[&str] = &[
         "Yes, run once",
         "Yes, allow for this session",
-        "No, skip this tool",
+        "No, skip this operation",
     ];
     const NUM_OPTIONS: usize = 3;
 
@@ -58,7 +58,22 @@ pub fn read_permission_choice_interactive(tool_name: &str, cmd: &str) -> u8 {
         lines.push(format!("  \x1b[33m╭─ Permission Required ─────────────────────────────\x1b[0m"));
         lines.push(format!("  \x1b[33m│\x1b[0m Tool: \x1b[1m{}\x1b[0m", tool_name));
         if !cmd.is_empty() {
-            lines.push(format!("  \x1b[33m│\x1b[0m Command: \x1b[2m{}\x1b[0m", cmd));
+            // 多行命令：每行都加 │  前缀，靠左对齐，超长行截断
+            const MAX_CMD_WIDTH: usize = 60;
+            const MAX_CMD_LINES: usize = 12;
+            let cmd_lines: Vec<&str> = cmd.lines().collect();
+            let show_count = cmd_lines.len().min(MAX_CMD_LINES);
+            lines.push(format!("  \x1b[33m│\x1b[0m Command:"));
+            for (i, cmd_line) in cmd_lines[..show_count].iter().enumerate() {
+                let trimmed = cmd_line.trim_end();
+                let display: String = trimmed.chars().take(MAX_CMD_WIDTH).collect();
+                let ellipsis = if trimmed.len() > MAX_CMD_WIDTH { "…" } else { "" };
+                lines.push(format!("  \x1b[33m│\x1b[0m   \x1b[2m{}{}\x1b[0m", display, ellipsis));
+                let _ = i;
+            }
+            if cmd_lines.len() > MAX_CMD_LINES {
+                lines.push(format!("  \x1b[33m│\x1b[0m   \x1b[2m… {} more lines\x1b[0m", cmd_lines.len() - MAX_CMD_LINES));
+            }
         }
         lines.push(format!("  \x1b[33m│\x1b[0m"));
         lines.push(format!("  \x1b[33m│\x1b[0m Do you want to proceed?"));

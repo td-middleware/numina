@@ -1,13 +1,7 @@
-/// MCP 客户端 — 通过 stdio 连接外部 MCP 服务器
+/// MCP 客户端 — 通过 stdio 或 HTTP/HTTPS 连接外部 MCP 服务器
 ///
-/// 协议：JSON-RPC 2.0 over stdio
+/// 协议：JSON-RPC 2.0 over stdio 或 HTTP POST (Streamable HTTP transport)
 /// 参考：https://modelcontextprotocol.io/docs/concepts/transports
-///
-/// 工作流程：
-/// 1. 启动 MCP 服务器子进程（command + args）
-/// 2. 发送 initialize 请求，完成握手
-/// 3. 发送 tools/list 获取工具列表
-/// 4. 发送 tools/call 执行工具
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -88,7 +82,7 @@ impl McpCallResult {
 }
 
 // ─────────────────────────────────────────────
-// McpClient
+// McpClient (stdio)
 // ─────────────────────────────────────────────
 
 struct McpInner {
@@ -309,11 +303,209 @@ impl McpClient {
 }
 
 // ─────────────────────────────────────────────
+// HTTP/HTTPS MCP 客户端（Streamable HTTP transport）
+// ─────────────────────────────────────────────
+
+/// 通过 HTTP POST 发送 JSON-RPC 请求到 MCP 服务器
+async fn http_send_request(
+    client: &reqwest::Client,
+    url: &str,
+    method: &str,
+    params: Option<Value>,
+    id: u64,
+) -> Result<Value> {
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params.unwrap_or(serde_json::json!({}))
+    });
+
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&req_body)
+        .send()
+        .await
+        .with_context(|| format!("HTTP request to MCP server failed: {}", url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("MCP HTTP server returned {}: {}", status, body);
+    }
+
+    let content_type = resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // 处理 SSE (text/event-stream) 响应
+    if content_type.contains("text/event-stream") {
+        let body = resp.text().await?;
+        // 解析 SSE 格式：找到 data: 行
+        for line in body.lines() {
+            let line = line.trim();
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim();
+                if data == "[DONE]" || data.is_empty() {
+                    continue;
+                }
+                if let Ok(json_resp) = serde_json::from_str::<JsonRpcResponse>(data) {
+                    if let Some(err) = json_resp.error {
+                        anyhow::bail!("MCP HTTP error: [{}] {}", err.code, err.message);
+                    }
+                    if let Some(result) = json_resp.result {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+        anyhow::bail!("No valid JSON-RPC response found in SSE stream");
+    } else {
+        // 普通 JSON 响应
+        let json_resp: JsonRpcResponse = resp.json().await
+            .with_context(|| "Failed to parse MCP HTTP response as JSON")?;
+
+        if let Some(err) = json_resp.error {
+            anyhow::bail!("MCP HTTP error: [{}] {}", err.code, err.message);
+        }
+
+        json_resp.result.ok_or_else(|| anyhow::anyhow!("MCP HTTP response has no result"))
+    }
+}
+
+/// 通过 HTTP/HTTPS 获取 MCP 工具列表
+pub async fn fetch_tools_http(
+    server_name: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    timeout_secs: u64,
+) -> Result<Vec<McpToolInfo>> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs));
+
+    // 对 https 启用 TLS（rustls）
+    // reqwest 默认已启用，这里显式设置
+    let client = builder.build()
+        .with_context(|| "Failed to build HTTP client")?;
+
+    // 构建带自定义 headers 的请求
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            default_headers.insert(name, val);
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .default_headers(default_headers)
+        .build()
+        .with_context(|| "Failed to build HTTP client with headers")?;
+
+    // Step 1: initialize
+    let init_params = serde_json::json!({
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "roots": { "listChanged": false },
+            "sampling": {}
+        },
+        "clientInfo": {
+            "name": "numina",
+            "version": "0.1.0"
+        }
+    });
+
+    http_send_request(&client, url, "initialize", Some(init_params), 1).await
+        .with_context(|| format!("HTTP MCP initialize failed for '{}'", server_name))?;
+
+    // Step 2: initialized notification（忽略错误）
+    let _ = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }))
+        .send()
+        .await;
+
+    // Step 3: tools/list
+    let result = http_send_request(&client, url, "tools/list", None, 2).await
+        .with_context(|| format!("HTTP MCP tools/list failed for '{}'", server_name))?;
+
+    let tools = result
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<McpToolInfo>(v.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(tools)
+}
+
+/// 检测 HTTP/HTTPS MCP 服务器是否可达（快速 ping）
+pub async fn check_http_reachable(url: &str, headers: &HashMap<String, String>, timeout_secs: u64) -> bool {
+    let mut header_map = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            header_map.insert(name, val);
+        }
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .default_headers(header_map)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // 发送一个简单的 initialize 请求来检测连通性
+    let req_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "numina", "version": "0.1.0" }
+        }
+    });
+
+    match client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&req_body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 405,
+        Err(_) => false,
+    }
+}
+
+// ─────────────────────────────────────────────
 // 快速连接（用于 CLI 工具列表展示，超时保护）
 // ─────────────────────────────────────────────
 
 /// 尝试连接 MCP 服务器并获取工具列表，带超时保护
-/// 用于 /mcp 命令的工具浏览器
+/// 支持 stdio、http、https 类型
 pub async fn fetch_tools_with_timeout(
     server_name: &str,
     command: &str,
@@ -336,6 +528,33 @@ pub async fn fetch_tools_with_timeout(
         }
         Err(_) => {
             tracing::warn!("Timeout connecting to MCP server '{}'", server_name);
+            vec![]
+        }
+    }
+}
+
+/// 通过 HTTP/HTTPS 获取工具列表（带超时保护）
+pub async fn fetch_tools_http_with_timeout(
+    server_name: &str,
+    url: &str,
+    headers: &HashMap<String, String>,
+    timeout_secs: u64,
+) -> Vec<McpToolInfo> {
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
+    let result = tokio::time::timeout(
+        timeout,
+        fetch_tools_http(server_name, url, headers, timeout_secs),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(e)) => {
+            tracing::warn!("Failed to fetch tools from HTTP MCP server '{}': {}", server_name, e);
+            vec![]
+        }
+        Err(_) => {
+            tracing::warn!("Timeout fetching tools from HTTP MCP server '{}'", server_name);
             vec![]
         }
     }
