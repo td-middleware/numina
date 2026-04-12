@@ -6,7 +6,7 @@ use crate::core::chat::ChatEngine;
 
 use super::commands::{cmd_mcp_browser, cmd_model_picker, cmd_sessions};
 use super::file_ref::expand_at_references;
-use super::permission::read_permission_choice_interactive;
+use super::permission::{read_permission_choice_interactive, read_permission_choice_mcp};
 use super::readline::{interactive_readline, ReadLine};
 use super::renderer::{
     estimate_context_size, print_context_bar, print_help, print_welcome,
@@ -63,9 +63,26 @@ fn render_tool_call(tool_info: &str) {
 }
 
 /// 渲染 JSON 内容块（带深色背景，缩进对齐）
+/// 对 body 字段的值（JSON 对象/数组）压缩成单行，减少行数
 fn render_json_block(json: &str) {
+    // 先尝试解析 JSON，对 body 字段做单行压缩
+    let display_json = if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(json) {
+        if let Some(obj) = val.as_object_mut() {
+            // 把 body 字段（如果是对象或数组）压缩成单行字符串
+            if let Some(body_val) = obj.get("body").cloned() {
+                if body_val.is_object() || body_val.is_array() {
+                    let compact = serde_json::to_string(&body_val).unwrap_or_default();
+                    obj.insert("body".to_string(), serde_json::Value::String(compact));
+                }
+            }
+        }
+        serde_json::to_string_pretty(&val).unwrap_or_else(|_| json.to_string())
+    } else {
+        json.to_string()
+    };
+
     // 最多显示 20 行，超出折叠
-    let lines: Vec<&str> = json.lines().collect();
+    let lines: Vec<&str> = display_json.lines().collect();
     let max_lines = 20usize;
     let show_lines = lines.len().min(max_lines);
     for line in &lines[..show_lines] {
@@ -134,6 +151,70 @@ fn poll_expand_key(expandable: &mut Vec<String>) -> bool {
 }
 
 // ─────────────────────────────────────────────
+// MCP 权限辅助：从 cmd 中解析 MCP server/tool/args
+// ─────────────────────────────────────────────
+
+/// 对于 http_post/http_get 工具，cmd 格式为 "url\x01json_body"
+/// 从 mcp.json 中按 URL 前缀匹配 server 名称，
+/// 从 json_body 中提取 JSON-RPC method 和 params
+/// 返回 (server_name, mcp_tool_name, args_json_pretty)
+fn resolve_mcp_info(tool_name: &str, cmd: &str) -> Option<(String, String, String)> {
+    // 只处理 http_post / http_get
+    if tool_name != "http_post" && tool_name != "http_get" {
+        return None;
+    }
+
+    // 解析 url 和 json_body
+    let (url, json_body) = if let Some(sep) = cmd.find('\x01') {
+        (&cmd[..sep], &cmd[sep + 1..])
+    } else {
+        // http_get 没有 body，cmd 就是 url
+        (cmd, "")
+    };
+
+    // 从 mcp.json 中查找匹配的 server
+    let server_name = crate::config::mcp::McpConfig::load()
+        .ok()
+        .and_then(|cfg| {
+            cfg.servers.into_iter().find(|s| {
+                s.enabled && url.starts_with(&s.command_or_url)
+            })
+        })
+        .map(|s| s.name)
+        .unwrap_or_else(|| {
+            // 无法匹配时，从 URL 中提取 host 作为名称
+            url.trim_start_matches("http://")
+               .trim_start_matches("https://")
+               .split('/')
+               .next()
+               .unwrap_or("unknown")
+               .to_string()
+        });
+
+    // 从 JSON-RPC body 中提取 method 和 params
+    let (mcp_tool, args_pretty) = if json_body.is_empty() {
+        (url.split('/').last().unwrap_or("request").to_string(), String::new())
+    } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_body) {
+        let method = val.get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("call")
+            .to_string();
+        // 优先取 params，否则取整个 body
+        let args = val.get("params")
+            .cloned()
+            .unwrap_or_else(|| val.clone());
+        // 单行紧凑格式显示（省行数，能显示完整参数），实际请求内容不受影响
+        let pretty = serde_json::to_string(&args).unwrap_or_default();
+        (method, pretty)
+    } else {
+        // 非 JSON body，直接显示
+        (url.split('/').last().unwrap_or("request").to_string(), json_body.to_string())
+    };
+
+    Some((server_name, mcp_tool, args_pretty))
+}
+
+// ─────────────────────────────────────────────
 // Session 持久化记忆（last_session）
 // ─────────────────────────────────────────────
 
@@ -195,6 +276,7 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
 
             let mut full_response = String::new();
             let mut in_code_block = false;
+            let mut code_block_buf = String::new();
             let mut line_buf = String::new();
             let mut stop_tx_opt = Some(stop_tx);
             let mut thinking_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -260,13 +342,20 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
                     let tool_name_owned = tool_name.to_string();
                     let cmd_owned = cmd.to_string();
                     let decision = tokio::task::spawn_blocking(move || {
-                        read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                        if let Some((server_name, mcp_tool, args_json)) =
+                            resolve_mcp_info(&tool_name_owned, &cmd_owned)
+                        {
+                            read_permission_choice_mcp(&server_name, &mcp_tool, &args_json)
+                        } else {
+                            read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                        }
                     })
                         .await
                         .unwrap_or(3);
                     let reply = match decision {
                         1 => format!("{}|allow", perm_id),
                         2 => format!("{}|allow_session", perm_id),
+                        0 => format!("{}|deny_abort", perm_id), // Esc = 强制中止整个 agent loop
                         _ => format!("{}|deny", perm_id),
                     };
                     println!();
@@ -311,14 +400,32 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
                             let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
                             if trimmed.starts_with("```") {
                                 if in_code_block {
+                                    // 代码块结束：检查是否需要折叠
+                                    let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                                    const CODE_FOLD_LINES: usize = 20;
+                                    if code_lines.len() > CODE_FOLD_LINES {
+                                        // 只显示前 CODE_FOLD_LINES 行，其余折叠
+                                        for line in &code_lines[..CODE_FOLD_LINES] {
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                        }
+                                        println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                                    } else {
+                                        for line in &code_lines {
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                        }
+                                    }
                                     print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                    code_block_buf.clear();
                                     in_code_block = false;
                                 } else {
                                     in_code_block = true;
+                                    code_block_buf.clear();
                                     print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
                                 }
                             } else if in_code_block {
-                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                // 代码块内容先缓存，等结束时统一折叠判断
+                                code_block_buf.push_str(trimmed);
+                                code_block_buf.push('\n');
                             } else {
                                 print!("{}\n", trimmed);
                             }
@@ -328,7 +435,8 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
                     }
                     if !line_buf.is_empty() {
                         if in_code_block {
-                            print!("{}{}{}", CODE_BG, CODE_FG, line_buf);
+                            // 代码块未结束，缓存内容（不立即打印）
+                            code_block_buf.push_str(&line_buf);
                         } else {
                             print!("{}", line_buf);
                         }
@@ -340,6 +448,21 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
             }
 
             if in_code_block {
+                // 代码块未正常结束（模型截断），把缓存内容全部打印出来
+                if !code_block_buf.is_empty() {
+                    let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                    const CODE_FOLD_LINES: usize = 20;
+                    if code_lines.len() > CODE_FOLD_LINES {
+                        for line in &code_lines[..CODE_FOLD_LINES] {
+                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                        }
+                        println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                    } else {
+                        for line in &code_lines {
+                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                        }
+                    }
+                }
                 print!("{}", RESET);
             }
             println!();
@@ -486,10 +609,24 @@ pub async fn run_interactive_with_session(
                 continue;
             }
             "/clear" => {
+                // 清屏 + 重置 session（上下文归零，下次对话重新开始）
+                current_session = None;
+                turn_count = 0;
+                accumulated_tokens = 0;
+                clear_last_session_id();
                 print!("\x1b[2J\x1b[H");
                 std::io::stdout().flush()?;
                 let model = engine.default_model();
-                print_welcome(&model, engine.skill_count(), current_session.as_deref(), true);
+                // current_session 已为 None，显示 0k/context_window
+                print_welcome(&model, engine.skill_count(), None, true);
+                // 显示上下文归零状态：0k / Xk
+                let model_provider = crate::config::ModelsConfig::load()
+                    .ok()
+                    .and_then(|mc| mc.models.iter().find(|m| m.name == model).map(|m| m.provider.clone()))
+                    .unwrap_or_else(|| "openai".to_string());
+                let ctx_size_str = estimate_context_size(&model_provider, &model);
+                let ctx_window: usize = ctx_size_str.parse::<usize>().unwrap_or(128) * 1000;
+                print_context_bar(0, ctx_window);
                 continue;
             }
             _ if input.starts_with('/') => {
@@ -524,6 +661,7 @@ pub async fn run_interactive_with_session(
                             });
                             let mut full_response = String::new();
                             let mut in_code_block = false;
+                            let mut code_block_buf = String::new();
                             let mut line_buf = String::new();
                             let mut stop_tx_opt = Some(stop_tx);
                             let mut thinking_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -571,11 +709,18 @@ pub async fn run_interactive_with_session(
                                     let tool_name_owned = tool_name.to_string();
                                     let cmd_owned = cmd.to_string();
                                     let decision = tokio::task::spawn_blocking(move || {
-                                        read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                                        if let Some((server_name, mcp_tool, args_json)) =
+                                            resolve_mcp_info(&tool_name_owned, &cmd_owned)
+                                        {
+                                            read_permission_choice_mcp(&server_name, &mcp_tool, &args_json)
+                                        } else {
+                                            read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                                        }
                                     }).await.unwrap_or(3);
                                     let reply = match decision {
                                         1 => format!("{}|allow", perm_id),
                                         2 => format!("{}|allow_session", perm_id),
+                                        0 => format!("{}|deny_abort", perm_id), // Esc = 强制中止整个 agent loop
                                         _ => format!("{}|deny", perm_id),
                                     };
                                     println!();
@@ -598,24 +743,70 @@ pub async fn run_interactive_with_session(
                                         if ch == '\n' {
                                             let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
                                             if trimmed.starts_with("```") {
-                                                if in_code_block { print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET); in_code_block = false; }
-                                                else { in_code_block = true; print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET); }
-                                            } else if in_code_block { print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET); }
-                                            else { print!("{}\n", trimmed); }
+                                                if in_code_block {
+                                                    // 代码块结束：检查是否需要折叠
+                                                    let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                                                    const CODE_FOLD_LINES: usize = 20;
+                                                    if code_lines.len() > CODE_FOLD_LINES {
+                                                        for line in &code_lines[..CODE_FOLD_LINES] {
+                                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                                        }
+                                                        println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                                                    } else {
+                                                        for line in &code_lines {
+                                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                                        }
+                                                    }
+                                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                                    code_block_buf.clear();
+                                                    in_code_block = false;
+                                                } else {
+                                                    in_code_block = true;
+                                                    code_block_buf.clear();
+                                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                                }
+                                            } else if in_code_block {
+                                                // 代码块内容先缓存，等结束时统一折叠判断
+                                                code_block_buf.push_str(trimmed);
+                                                code_block_buf.push('\n');
+                                            } else {
+                                                print!("{}\n", trimmed);
+                                            }
                                             std::io::stdout().flush()?;
                                             line_buf.clear();
                                         }
                                     }
                                     if !line_buf.is_empty() {
-                                        if in_code_block { print!("{}{}{}", CODE_BG, CODE_FG, line_buf); }
-                                        else { print!("{}", line_buf); }
+                                        if in_code_block {
+                                            // 代码块未结束，缓存内容（不立即打印）
+                                            code_block_buf.push_str(&line_buf);
+                                        } else {
+                                            print!("{}", line_buf);
+                                        }
                                         std::io::stdout().flush()?;
                                         line_buf.clear();
                                     }
                                     full_response.push_str(text);
                                 }
                             }
-                            if in_code_block { print!("{}", RESET); }
+                            if in_code_block {
+                                // 代码块未正常结束，把缓存内容全部打印出来
+                                if !code_block_buf.is_empty() {
+                                    let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                                    const CODE_FOLD_LINES: usize = 20;
+                                    if code_lines.len() > CODE_FOLD_LINES {
+                                        for line in &code_lines[..CODE_FOLD_LINES] {
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                        }
+                                        println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                                    } else {
+                                        for line in &code_lines {
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                        }
+                                    }
+                                }
+                                print!("{}", RESET);
+                            }
                             println!();
                             println!();
                             let current_tokens = ChatEngine::get_session(&sid)
@@ -673,6 +864,7 @@ pub async fn run_interactive_with_session(
 
                 let mut full_response = String::new();
                 let mut in_code_block = false;
+                let mut code_block_buf = String::new();
                 let mut line_buf = String::new();
                 let mut stop_tx_opt = Some(stop_tx);
                 let mut thinking_task: Option<tokio::task::JoinHandle<()>> = None;
@@ -738,13 +930,20 @@ pub async fn run_interactive_with_session(
                         let tool_name_owned = tool_name.to_string();
                         let cmd_owned = cmd.to_string();
                         let decision = tokio::task::spawn_blocking(move || {
-                            read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                            if let Some((server_name, mcp_tool, args_json)) =
+                                resolve_mcp_info(&tool_name_owned, &cmd_owned)
+                            {
+                                read_permission_choice_mcp(&server_name, &mcp_tool, &args_json)
+                            } else {
+                                read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                            }
                         })
                             .await
                             .unwrap_or(3);
                         let reply = match decision {
                             1 => format!("{}|allow", perm_id),
                             2 => format!("{}|allow_session", perm_id),
+                            0 => format!("{}|deny_abort", perm_id), // Esc = 强制中止整个 agent loop
                             _ => format!("{}|deny", perm_id),
                         };
                         println!();
@@ -787,14 +986,31 @@ pub async fn run_interactive_with_session(
                                 let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
                                 if trimmed.starts_with("```") {
                                     if in_code_block {
+                                        // 代码块结束：检查是否需要折叠
+                                        let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                                        const CODE_FOLD_LINES: usize = 20;
+                                        if code_lines.len() > CODE_FOLD_LINES {
+                                            for line in &code_lines[..CODE_FOLD_LINES] {
+                                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                            }
+                                            println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                                        } else {
+                                            for line in &code_lines {
+                                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                            }
+                                        }
                                         print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                        code_block_buf.clear();
                                         in_code_block = false;
                                     } else {
                                         in_code_block = true;
+                                        code_block_buf.clear();
                                         print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
                                     }
                                 } else if in_code_block {
-                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                    // 代码块内容先缓存，等结束时统一折叠判断
+                                    code_block_buf.push_str(trimmed);
+                                    code_block_buf.push('\n');
                                 } else {
                                     print!("{}\n", trimmed);
                                 }
@@ -804,7 +1020,8 @@ pub async fn run_interactive_with_session(
                         }
                         if !line_buf.is_empty() {
                             if in_code_block {
-                                print!("{}{}{}", CODE_BG, CODE_FG, line_buf);
+                                // 代码块未结束，缓存内容（不立即打印）
+                                code_block_buf.push_str(&line_buf);
                             } else {
                                 print!("{}", line_buf);
                             }
@@ -816,6 +1033,21 @@ pub async fn run_interactive_with_session(
                 }
 
                 if in_code_block {
+                    // 代码块未正常结束，把缓存内容全部打印出来
+                    if !code_block_buf.is_empty() {
+                        let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                        const CODE_FOLD_LINES: usize = 20;
+                        if code_lines.len() > CODE_FOLD_LINES {
+                            for line in &code_lines[..CODE_FOLD_LINES] {
+                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                            }
+                            println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                        } else {
+                            for line in &code_lines {
+                                print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                            }
+                        }
+                    }
                     print!("{}", RESET);
                 }
                 println!();
@@ -886,27 +1118,33 @@ pub async fn execute(args: &ChatArgs) -> Result<()> {
 
     print_welcome(&model_name, skill_count, effective_session.as_deref(), true);
 
+    // 计算上下文窗口大小（用于显示 context bar）
+    let ctx_window = {
+        let provider = ModelsConfig::load()
+            .ok()
+            .and_then(|mc| mc.models.iter().find(|m| m.name == model_name).map(|m| m.provider.clone()))
+            .unwrap_or_else(|| "openai".to_string());
+        let ctx_k: usize = estimate_context_size(&provider, &model_name).parse().unwrap_or(128);
+        ctx_k * 1000
+    };
+
     if let Some(ref sid) = restored_session {
         println!("  {}↩  Resumed session {}{}{}", GRAY, BOLD, &sid[..8.min(sid.len())], RESET);
         println!("  {}    Use /new to start a fresh conversation.{}", DIM, RESET);
         println!();
-
-        if let Ok(session) = ChatEngine::get_session(sid) {
-            let used_chars: usize = session.turns.iter().map(|t| t.content.len()).sum();
-            let used_tokens = used_chars / 4;
-            let ctx_window = {
-                let provider = ModelsConfig::load()
-                    .ok()
-                    .and_then(|mc| mc.models.iter().find(|m| m.name == model_name).map(|m| m.provider.clone()))
-                    .unwrap_or_else(|| "openai".to_string());
-                let ctx_k: usize = estimate_context_size(&provider, &model_name).parse().unwrap_or(128);
-                ctx_k * 1000
-            };
-            if used_tokens > 0 {
-                print_context_bar(used_tokens, ctx_window);
-            }
-        }
     }
+
+    // 显示上下文使用情况：
+    // - 有 session（自动恢复或 --session 指定）→ 读取历史累计 token 用量
+    // - 全新 session（/new、/clear 后或首次启动无历史）→ 显示 0k
+    let init_used_tokens = if let Some(ref sid) = effective_session {
+        ChatEngine::get_session(sid)
+            .map(|s| s.turns.iter().map(|t| t.content.len()).sum::<usize>() / 4)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    print_context_bar(init_used_tokens, ctx_window);
 
     run_interactive_with_session(&engine, args, effective_session).await
 }

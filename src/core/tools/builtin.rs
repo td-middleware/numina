@@ -680,7 +680,9 @@ impl ToolExecutor for HttpPostTool {
         let url = params["url"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("http_post: missing 'url' parameter"))?;
-        let max_bytes = params["max_bytes"].as_u64().unwrap_or(32768) as usize;
+        // 默认 512KB，MCP 响应数据可能很大（如 search_alert 返回 ~30KB+）
+        // 截断会导致 AI 收到不完整 JSON，误以为调用失败而反复重试
+        let max_bytes = params["max_bytes"].as_u64().unwrap_or(524288) as usize;
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -707,12 +709,73 @@ impl ToolExecutor for HttpPostTool {
         }
 
         // 设置请求体
-        let body_str = if params["body"].is_null() || !params.get("body").is_some() {
+        // 辅助函数：对 JSON-RPC body 按标准字段顺序重排（jsonrpc → id → method → params）
+        // 避免字段顺序不确定导致服务端解析 method 为空（-32601 "Method not found: "）
+        let normalize_jsonrpc = |val: &serde_json::Value| -> String {
+            if val.get("jsonrpc").is_some() && val.get("method").is_some() {
+                let jsonrpc = val.get("jsonrpc").cloned().unwrap_or(serde_json::Value::Null);
+                let id = val.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let method = val.get("method").cloned().unwrap_or(serde_json::Value::Null);
+                let rpc_params = val.get("params").cloned().unwrap_or(serde_json::json!({}));
+                let ordered = serde_json::json!({
+                    "jsonrpc": jsonrpc,
+                    "id": id,
+                    "method": method,
+                    "params": rpc_params
+                });
+                serde_json::to_string(&ordered).unwrap_or_default()
+            } else {
+                serde_json::to_string(val).unwrap_or_default()
+            }
+        };
+
+        let body_str = if params["body"].is_null() || params.get("body").is_none() {
             String::new()
         } else if params["body"].is_string() {
-            params["body"].as_str().unwrap_or("").to_string()
+            // body 是字符串形式：尝试解析为 JSON 后重排字段顺序
+            let s = params["body"].as_str().unwrap_or("");
+            // 多轮尝试解析：
+            // 1. 直接解析
+            // 2. trim 后解析（处理首尾空白/BOM）
+            // 3. 去除控制字符后解析
+            // 4. 处理双重转义（\\\" → \"）后解析
+            let cleaned: String = s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t').collect();
+            let unescaped = s.replace("\\\"", "\"").replace("\\'", "'");
+            let parsed_opt = serde_json::from_str::<serde_json::Value>(s).ok()
+                .or_else(|| serde_json::from_str::<serde_json::Value>(s.trim()).ok())
+                .or_else(|| serde_json::from_str::<serde_json::Value>(&cleaned).ok())
+                .or_else(|| serde_json::from_str::<serde_json::Value>(cleaned.trim()).ok())
+                .or_else(|| serde_json::from_str::<serde_json::Value>(&unescaped).ok())
+                .or_else(|| serde_json::from_str::<serde_json::Value>(unescaped.trim()).ok());
+            if let Some(parsed) = parsed_opt {
+                // 解析成功：normalize（统一字段顺序）
+                normalize_jsonrpc(&parsed)
+            } else if s.trim_start().starts_with('{') || s.trim_start().starts_with('[') {
+                // 看起来是 JSON 但解析失败（最常见原因：AI 生成的 JSON 字符串不完整，缺结尾 }）
+                // 尝试自动补全：统计 { 和 } 的数量，补足缺失的 }
+                let open = cleaned.chars().filter(|&c| c == '{').count();
+                let close = cleaned.chars().filter(|&c| c == '}').count();
+                let missing = open.saturating_sub(close);
+                let repaired = if missing > 0 {
+                    let suffix: String = "}".repeat(missing);
+                    format!("{}{}", cleaned.trim_end_matches(|c: char| c.is_whitespace() || c == ','), suffix)
+                } else {
+                    cleaned.trim().to_string()
+                };
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&repaired) {
+                    // 修复成功，使用修复后的 JSON
+                    normalize_jsonrpc(&parsed)
+                } else {
+                    // 无法修复，直接把字符串作为 body 发送（让服务端处理）
+                    s.to_string()
+                }
+            } else {
+                // 非 JSON 字符串（如 form-encoded 等），直接发送
+                s.to_string()
+            }
         } else {
-            serde_json::to_string(&params["body"]).unwrap_or_default()
+            // body 是 JSON 对象（推荐方式）：直接 normalize
+            normalize_jsonrpc(&params["body"])
         };
 
         if !body_str.is_empty() {
@@ -766,7 +829,10 @@ impl ToolExecutor for HttpPostTool {
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "The URL to POST to" },
-                "body": { "description": "Request body (JSON object or string). For MCP JSON-RPC: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tool_name\",\"arguments\":{...}}}" },
+                "body": {
+                    "type": "object",
+                    "description": "Request body as a JSON object (NOT a string). For MCP JSON-RPC use: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"tool_name\",\"arguments\":{...}}}"
+                },
                 "headers": { "type": "object", "description": "Additional HTTP headers as key-value pairs" },
                 "content_type": { "type": "string", "description": "Content-Type header (default: application/json)" },
                 "max_bytes": { "type": "integer", "description": "Maximum response body size in bytes (default: 32768)" }

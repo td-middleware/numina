@@ -345,7 +345,7 @@ impl SkillManager {
         self.find(cmd).map(|s| (s, args))
     }
 
-    /// 生成注入 system prompt 的 skills 描述块
+    /// 生成注入 system prompt 的 skills 描述块（简单模式，仅列出名称和描述）
     pub fn system_prompt_block(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
@@ -372,6 +372,221 @@ impl SkillManager {
 
         lines.push(String::new());
         lines.push("When the user invokes a skill with `/skill-name [args]`, execute the skill's instructions with the provided arguments.".to_string());
+
+        lines.join("\n")
+    }
+
+    /// 【方案一】生成轻量摘要块（只含 name + description + when_to_use 关键词）
+    /// 用于 system prompt 固定注入，token 消耗极低（~50 tokens/skill）
+    pub fn summary_prompt_block(&self) -> String {
+        if self.skills.is_empty() {
+            return String::new();
+        }
+
+        let auto_skills: Vec<&Skill> = self.skills.iter()
+            .filter(|s| s.when_to_use.is_some())
+            .collect();
+        let manual_skills: Vec<&Skill> = self.skills.iter()
+            .filter(|s| s.when_to_use.is_none())
+            .collect();
+
+        let mut lines: Vec<String> = Vec::new();
+
+        if !auto_skills.is_empty() {
+            lines.push("## Available Skills (Intent-Triggered)".to_string());
+            lines.push(String::new());
+            lines.push("When user intent matches a skill's trigger condition, the system will automatically inject the full skill instructions. You do NOT need to ask the user to type a slash command.".to_string());
+            lines.push(String::new());
+            for skill in &auto_skills {
+                let wtu = skill.when_to_use.as_deref().unwrap_or("");
+                lines.push(format!("- **{}**: {} | Trigger: {}", skill.name, skill.description, wtu));
+            }
+            lines.push(String::new());
+        }
+
+        if !manual_skills.is_empty() {
+            lines.push("## Manual Skills (Slash Commands)".to_string());
+            lines.push(String::new());
+            for skill in &manual_skills {
+                let arg_hint = skill.argument_hint.as_deref().unwrap_or("");
+                if arg_hint.is_empty() {
+                    lines.push(format!("- `/{}`  — {}", skill.name, skill.description));
+                } else {
+                    lines.push(format!("- `/{} {}`  — {}", skill.name, arg_hint, skill.description));
+                }
+            }
+            lines.push(String::new());
+        }
+
+        lines.join("\n")
+    }
+
+    /// 【方案一】根据用户输入匹配意图，返回命中的 skill 列表（按相关度排序）
+    ///
+    /// 匹配逻辑：
+    /// 1. 把 `when_to_use` 中的中文顿号/逗号/空格分割为关键词列表
+    /// 2. 对每个关键词，同时生成"后缀子词"（如"控制器告警" → 也生成"告警"）
+    /// 3. 用户输入中包含任意关键词或子词则命中
+    /// 4. 命中关键词越多，排序越靠前
+    pub fn match_intent<'a>(&'a self, user_input: &str) -> Vec<(&'a Skill, usize)> {
+        let input_lower = user_input.to_lowercase();
+
+        let mut matches: Vec<(&Skill, usize)> = self.skills.iter()
+            .filter(|s| s.when_to_use.is_some())
+            .filter_map(|skill| {
+                let wtu = skill.when_to_use.as_deref().unwrap_or("");
+
+                // 分割 when_to_use 为原始关键词（支持中文顿号、逗号、空格、斜杠、竖线）
+                let raw_keywords: Vec<&str> = wtu
+                    .split(|c| c == '、' || c == ',' || c == ' ' || c == '/' || c == '|')
+                    .map(|s| s.trim())
+                    .filter(|s| {
+                        let char_count = s.chars().count();
+                        char_count >= 2 // 按字符数过滤（中文每字1个字符）
+                    })
+                    .collect();
+
+                // 扩展关键词：对长关键词（>3个字符）提取后缀子词
+                // 例如："控制器告警" → ["控制器告警", "告警"]
+                //       "当用户提到控制器告警" → 跳过（太长的前缀词）
+                let mut expanded: Vec<String> = Vec::new();
+                for kw in &raw_keywords {
+                    let chars: Vec<char> = kw.chars().collect();
+                    let char_len = chars.len();
+                    expanded.push(kw.to_string());
+                    // 对 3-6 字符的关键词，提取后 2 个字符作为子词
+                    if char_len >= 3 && char_len <= 8 {
+                        // 后缀：最后2个字符
+                        let suffix2: String = chars[char_len.saturating_sub(2)..].iter().collect();
+                        if suffix2.chars().count() >= 2 {
+                            expanded.push(suffix2);
+                        }
+                        // 后缀：最后3个字符（如果够长）
+                        if char_len >= 4 {
+                            let suffix3: String = chars[char_len.saturating_sub(3)..].iter().collect();
+                            expanded.push(suffix3);
+                        }
+                    }
+                }
+
+                // 去重
+                expanded.sort();
+                expanded.dedup();
+
+                let hit_count = expanded.iter()
+                    .filter(|kw| input_lower.contains(&kw.to_lowercase()))
+                    .count();
+
+                if hit_count > 0 {
+                    Some((skill, hit_count))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 按命中数降序排序
+        matches.sort_by(|a, b| b.1.cmp(&a.1));
+        matches
+    }
+
+    /// 【方案一】为命中的 skill 生成完整内容块（按需展开，注入到本次请求）
+    pub fn expand_matched_skills(&self, user_input: &str) -> String {
+        let matched = self.match_intent(user_input);
+        if matched.is_empty() {
+            return String::new();
+        }
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push("## Activated Skills (Full Instructions)".to_string());
+        lines.push(String::new());
+        lines.push("The following skills have been automatically activated based on your request:".to_string());
+        lines.push(String::new());
+
+        for (skill, hit_count) in &matched {
+            lines.push(format!("### Skill: `{}` — {} (matched {} keyword{})",
+                skill.name, skill.description, hit_count,
+                if *hit_count > 1 { "s" } else { "" }
+            ));
+            if let Some(ref wtu) = skill.when_to_use {
+                lines.push(format!("**Triggered by**: {}", wtu));
+            }
+            if let Some(ref hint) = skill.argument_hint {
+                lines.push(format!("**Arguments**: {}", hint));
+            }
+            lines.push(String::new());
+            lines.push("**Full Instructions**:".to_string());
+            lines.push(skill.content.clone());
+            lines.push(String::new());
+            lines.push("---".to_string());
+            lines.push(String::new());
+        }
+
+        lines.join("\n")
+    }
+
+    /// 生成自动意图触发的 skills 描述块（注入 system prompt）
+    ///
+    /// - 有 `when_to_use` 的 skill → **自动触发型**：注入完整内容，AI 根据用户意图自动执行
+    /// - 无 `when_to_use` 的 skill → **手动型**：只列出名称和描述（需用户 `/skill-name` 调用）
+    pub fn auto_trigger_prompt_block(&self) -> String {
+        if self.skills.is_empty() {
+            return String::new();
+        }
+
+        let auto_skills: Vec<&Skill> = self.skills.iter()
+            .filter(|s| s.when_to_use.is_some())
+            .collect();
+        let manual_skills: Vec<&Skill> = self.skills.iter()
+            .filter(|s| s.when_to_use.is_none())
+            .collect();
+
+        let mut lines: Vec<String> = Vec::new();
+
+        // ── 自动触发型 skills ──
+        if !auto_skills.is_empty() {
+            lines.push("## Skills (Auto-Triggered by Intent)".to_string());
+            lines.push(String::new());
+            lines.push(
+                "The following skills are activated **automatically** when you detect the user's intent matches. \
+                You do NOT need to wait for the user to type a slash command — just execute the skill directly."
+                .to_string()
+            );
+            lines.push(String::new());
+
+            for skill in &auto_skills {
+                let when_to_use = skill.when_to_use.as_deref().unwrap_or("");
+                lines.push(format!("### Skill: `{}` — {}", skill.name, skill.description));
+                lines.push(format!("**Activate when**: {}", when_to_use));
+                if let Some(ref hint) = skill.argument_hint {
+                    lines.push(format!("**Arguments**: {}", hint));
+                }
+                lines.push(String::new());
+                lines.push("**Instructions**:".to_string());
+                lines.push(skill.content.clone());
+                lines.push(String::new());
+                lines.push("---".to_string());
+                lines.push(String::new());
+            }
+        }
+
+        // ── 手动型 skills（仅列出，不注入完整内容）──
+        if !manual_skills.is_empty() {
+            lines.push("## Skills (Manual Slash Commands)".to_string());
+            lines.push(String::new());
+            lines.push("The following skills must be explicitly invoked with `/skill-name [args]`:".to_string());
+            lines.push(String::new());
+
+            for skill in &manual_skills {
+                let arg_hint = skill.argument_hint.as_deref().unwrap_or("");
+                if arg_hint.is_empty() {
+                    lines.push(format!("- `/{}`  — {}", skill.name, skill.description));
+                } else {
+                    lines.push(format!("- `/{} {}`  — {}", skill.name, arg_hint, skill.description));
+                }
+            }
+            lines.push(String::new());
+        }
 
         lines.join("\n")
     }
@@ -588,5 +803,108 @@ $ARGUMENT
         let mgr = SkillManager::empty();
         assert!(mgr.skills().is_empty());
         assert_eq!(mgr.system_prompt_block(), "");
+    }
+
+    // ── match_intent 测试 ──
+
+    fn make_alert_skill() -> Skill {
+        Skill {
+            name: "alert-search".to_string(),
+            description: "搜索控制器告警数据".to_string(),
+            when_to_use: Some("当用户提到控制器告警、告警搜索、告警数据、告警分析、告警看板、SearchBI、告警报告、查告警、找告警、alert search、alert data 时自动触发".to_string()),
+            argument_hint: Some("<告警查询描述>".to_string()),
+            content: "## 告警搜索指令\n调用 search_alert 工具".to_string(),
+            base_dir: None,
+            loaded_from: SkillSource::Global,
+            examples: vec![],
+        }
+    }
+
+    #[test]
+    fn test_match_intent_direct_keyword() {
+        // 直接包含关键词"告警数据"
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let matches = mgr.match_intent("帮我查下 XCU-A 的告警数据");
+        assert!(!matches.is_empty(), "应该命中 alert-search");
+        assert_eq!(matches[0].0.name, "alert-search");
+    }
+
+    #[test]
+    fn test_match_intent_suffix_keyword() {
+        // "温度告警" 不在关键词列表，但"告警"是"控制器告警"的后缀子词，应该命中
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let matches = mgr.match_intent("给我找下最近一周 ThorU 的温度告警");
+        assert!(!matches.is_empty(), "应该通过后缀子词'告警'命中 alert-search");
+        assert_eq!(matches[0].0.name, "alert-search");
+    }
+
+    #[test]
+    fn test_match_intent_english_keyword() {
+        // 英文关键词 "alert search"
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let matches = mgr.match_intent("alert search for kernel panic");
+        assert!(!matches.is_empty(), "应该命中 alert-search（英文关键词）");
+    }
+
+    #[test]
+    fn test_match_intent_searchbi() {
+        // SearchBI 关键词（大小写不敏感）
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let matches = mgr.match_intent("searchbi 告警看板");
+        assert!(!matches.is_empty(), "应该命中 alert-search（SearchBI）");
+    }
+
+    #[test]
+    fn test_match_intent_no_match() {
+        // 无关输入不应命中
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let matches = mgr.match_intent("帮我 review 这段代码");
+        assert!(matches.is_empty(), "代码 review 不应命中 alert-search");
+
+        let matches2 = mgr.match_intent("ls -la");
+        assert!(matches2.is_empty(), "ls 命令不应命中任何 skill");
+    }
+
+    #[test]
+    fn test_match_intent_multi_skill_ranking() {
+        // 多个 skill 时，命中关键词多的排在前面
+        let alert_skill = make_alert_skill();
+        let review_skill = Skill {
+            name: "code-review".to_string(),
+            description: "代码审查".to_string(),
+            when_to_use: Some("当用户说 review 代码、审查代码、代码质量时".to_string()),
+            argument_hint: None,
+            content: "审查代码".to_string(),
+            base_dir: None,
+            loaded_from: SkillSource::Global,
+            examples: vec![],
+        };
+        let mgr = SkillManager::new(vec![alert_skill, review_skill]);
+
+        // 包含多个告警关键词，alert-search 应排第一
+        let matches = mgr.match_intent("SearchBI 告警看板 告警数据分析");
+        assert!(!matches.is_empty());
+        assert_eq!(matches[0].0.name, "alert-search");
+    }
+
+    #[test]
+    fn test_summary_prompt_block_contains_trigger() {
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let block = mgr.summary_prompt_block();
+        assert!(block.contains("alert-search"));
+        assert!(block.contains("Trigger:"));
+        assert!(block.contains("Intent-Triggered"));
+        // 不应包含完整内容
+        assert!(!block.contains("search_alert"));
+    }
+
+    #[test]
+    fn test_expand_matched_skills_contains_full_content() {
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let expanded = mgr.expand_matched_skills("查告警数据");
+        assert!(!expanded.is_empty());
+        assert!(expanded.contains("Activated Skills"));
+        assert!(expanded.contains("search_alert")); // 完整内容
+        assert!(expanded.contains("alert-search"));
     }
 }

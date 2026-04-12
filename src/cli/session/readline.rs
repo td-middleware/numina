@@ -371,6 +371,8 @@ pub fn interactive_readline(
     let mut candidates: Vec<Pair> = Vec::new();
     let mut selected: Option<usize> = None;
     let mut offset: usize = 0;
+    // 是否正在翻历史（翻历史时不触发补全列表）
+    let mut in_history_browse = false;
 
     let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
 
@@ -397,22 +399,48 @@ pub fn interactive_readline(
             // ── Enter 提交 / 确认候选 ──
             Event::Key(KeyEvent { code: KeyCode::Enter, modifiers: KeyModifiers::NONE, .. }) => {
                 if let Some(idx) = selected {
+                    // 有选中候选项：应用候选
+                    let is_file_completion = offset > 0; // offset > 0 表示 @ 触发的文件/目录补全
                     apply_candidate(&mut chars, &mut cursor, &candidates[idx], offset);
                     selected = None;
                     candidates.clear();
                     offset = 0;
-                    // 如果 apply 后的内容是完整的斜杠命令（精确匹配），直接提交
+                    in_history_browse = false;
+
+                    if is_file_completion {
+                        // @ 文件/目录补全：只完成补全，不提交，让用户继续输入
+                        let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                    } else {
+                        // /命令 补全：应用后直接提交
+                        let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                        let _ = execute!(out, Print("\r\n"));
+                        let line: String = chars.iter().collect();
+                        break ReadLine::Line(line);
+                    }
+                } else if in_history_browse {
+                    // 从历史翻来的内容按 Enter：
+                    // 如果是 / 开头的命令，先显示补全列表供选择
                     let line: String = chars.iter().collect();
-                    let is_exact_cmd = super::completer::SLASH_COMMANDS
-                        .iter()
-                        .any(|(cmd, _)| *cmd == line.as_str());
-                    if is_exact_cmd {
+                    if line.starts_with('/') {
+                        in_history_browse = false;
+                        history_idx = None;
+                        update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
+                        if !candidates.is_empty() {
+                            // 显示补全列表，等待用户选择
+                            let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                        } else {
+                            // 没有补全候选，直接提交
+                            let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
+                            let _ = execute!(out, Print("\r\n"));
+                            break ReadLine::Line(line);
+                        }
+                    } else {
+                        // 非命令历史，直接提交
+                        in_history_browse = false;
                         let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
                         let _ = execute!(out, Print("\r\n"));
                         break ReadLine::Line(line);
                     }
-                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
-                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
                 } else {
                     let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
                     let _ = execute!(out, Print("\r\n"));
@@ -445,8 +473,11 @@ pub fn interactive_readline(
                 }
             }
             // ── ↑ 候选上移 / 历史向上 ──
+            // 规则：正在翻历史（in_history_browse）或无候选时，上键翻历史（不显示补全）
+            //       未翻历史且有候选时，上键在候选列表里移动
             Event::Key(KeyEvent { code: KeyCode::Up, modifiers: KeyModifiers::NONE, .. }) => {
-                if !candidates.is_empty() {
+                if !in_history_browse && !candidates.is_empty() {
+                    // 有补全候选且未在翻历史：上键在候选列表里移动
                     let n = candidates.len().min(MAX_COMPLETION_DISPLAY);
                     selected = Some(match selected {
                         None | Some(0) => n.saturating_sub(1),
@@ -454,6 +485,10 @@ pub fn interactive_readline(
                     });
                     let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
                 } else if !history.is_empty() {
+                    // 翻历史模式：关闭补全列表，不触发新的补全
+                    candidates.clear();
+                    selected = None;
+                    offset = 0;
                     if history_idx.is_none() { history_saved = chars.iter().collect(); }
                     let idx = match history_idx {
                         None => history.len() - 1,
@@ -461,15 +496,17 @@ pub fn interactive_readline(
                         Some(i) => i - 1,
                     };
                     history_idx = Some(idx);
+                    in_history_browse = true;
                     chars = history[idx].chars().collect();
                     cursor = chars.len();
-                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
-                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                    // 翻历史时不显示补全列表
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
                 }
             }
             // ── ↓ 候选下移 / 历史向下 ──
             Event::Key(KeyEvent { code: KeyCode::Down, modifiers: KeyModifiers::NONE, .. }) => {
-                if !candidates.is_empty() {
+                if !in_history_browse && !candidates.is_empty() {
+                    // 有补全候选且未在翻历史：下键在候选列表里移动
                     let n = candidates.len().min(MAX_COMPLETION_DISPLAY);
                     selected = Some(match selected {
                         None => 0,
@@ -477,16 +514,21 @@ pub fn interactive_readline(
                     });
                     let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
                 } else if let Some(idx) = history_idx {
+                    // 翻历史模式：继续向下翻
+                    candidates.clear();
+                    selected = None;
+                    offset = 0;
                     if idx + 1 < history.len() {
                         history_idx = Some(idx + 1);
                         chars = history[idx + 1].chars().collect();
                     } else {
                         history_idx = None;
+                        in_history_browse = false;
                         chars = history_saved.chars().collect();
                     }
                     cursor = chars.len();
-                    update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
-                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
+                    // 翻历史时不显示补全列表
+                    let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &[], None);
                 }
             }
             // ── ← 光标左移 ──
@@ -556,17 +598,8 @@ pub fn interactive_readline(
                 chars.insert(cursor, c);
                 cursor += 1;
                 history_idx = None;
+                in_history_browse = false; // 用户开始输入，退出历史翻看模式
                 update_completion(&chars, cursor, &mut candidates, &mut selected, &mut offset);
-                // 如果当前输入已经是精确匹配的命令，不显示补全列表（避免上下键被补全捕获）
-                let line: String = chars.iter().collect();
-                let is_exact_cmd = super::completer::SLASH_COMMANDS
-                    .iter()
-                    .any(|(cmd, _)| *cmd == line.as_str());
-                if is_exact_cmd {
-                    candidates.clear();
-                    selected = None;
-                    offset = 0;
-                }
                 let _ = redraw_input_line(&mut out, prompt, &chars, cursor, &candidates, selected);
             }
             _ => {}

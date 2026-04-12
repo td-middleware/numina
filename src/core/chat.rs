@@ -257,20 +257,27 @@ impl ChatEngine {
         Ok(Self { config, skill_manager })
     }
 
-    /// 构建 system prompt（包含 skills 描述）
+    /// 构建 system prompt（包含 skills 摘要，方案一：轻量注入）
     fn build_system_prompt(&self) -> String {
         let mut parts = vec![
             "You are Numina, an AI coding assistant. You help developers write, review, debug, and understand code.".to_string(),
             "Be concise, accurate, and helpful. When writing code, prefer idiomatic patterns.".to_string(),
         ];
 
-        let skills_block = self.skill_manager.system_prompt_block();
+        // 方案一：只注入轻量摘要（~50 tokens/skill），完整内容按需展开
+        let skills_block = self.skill_manager.summary_prompt_block();
         if !skills_block.is_empty() {
             parts.push(String::new());
             parts.push(skills_block);
         }
 
         parts.join("\n")
+    }
+
+    /// 【方案一】根据用户输入，按需展开命中的 skill 完整内容
+    /// 返回空字符串表示没有命中任何 skill
+    pub fn expand_skills_for_input(&self, user_input: &str) -> String {
+        self.skill_manager.expand_matched_skills(user_input)
     }
 
     /// 构建发送给模型的消息列表，自动压缩超长上下文
@@ -499,6 +506,10 @@ impl ChatEngine {
             "I don't have the ability to run",
             "我无法运行",
             "cannot run commands",
+            "~/.claude",
+            "claude code",
+            "claude.json",
+            "anthropic api key",
         ];
         let history_turns: Vec<_> = history_turns.into_iter().filter(|m| {
             // 只过滤 assistant 消息中的拒绝性内容
@@ -526,6 +537,22 @@ impl ChatEngine {
         session.push("user", user_message);
         messages.push(Message::new(Role::User, user_message.to_string()));
 
+        // ── 【方案一】按需展开 skill 完整内容 ──
+        // system prompt 只有轻量摘要，这里根据用户输入关键词匹配，命中则注入完整 skill 内容
+        // 这样 token 消耗从"全量注入"降为"按需注入"
+        let skill_expansion = self.skill_manager.expand_matched_skills(user_message);
+        if !skill_expansion.is_empty() {
+            // 作为 user/assistant 对注入，让 AI 知道已激活的 skill 完整指令
+            messages.push(Message::new(
+                Role::User,
+                format!("[SYSTEM: Skill auto-activated based on your request]\n\n{}", skill_expansion),
+            ));
+            messages.push(Message::new(
+                Role::Assistant,
+                "I understand. I will follow the activated skill instructions to handle your request.".to_string(),
+            ));
+        }
+
         // 估算发送的 token 数：只计算 session turns（不含 system prompt 和工具定义）
         // 这样与 CLI 层恢复 session 时的估算方式一致，避免重新进入后 context bar 跳变
         let sent_tokens: usize = session.turns.iter().map(|t| t.content.len()).sum::<usize>() / 4;
@@ -545,10 +572,148 @@ impl ChatEngine {
         tokio::spawn(async move {
             // 参考实现：MAX_ITERATIONS 防止无限循环
             const MAX_ITERATIONS: usize = 15;
-            const MAX_TOOL_RESULT_CHARS: usize = 20000;
+            const MAX_TOOL_RESULT_CHARS: usize = 10000;
 
             // 需要权限确认的工具名集合
-            const NEEDS_PERMISSION: &[&str] = &["shell", "write_file", "edit_file"];
+            const NEEDS_PERMISSION: &[&str] = &["shell", "write_file", "edit_file", "http_post", "http_get"];
+
+            // ── 预取所有 MCP 服务器的 tools/list，注入到对话上下文 ──
+            // 这样 AI 在第一次调用前就知道真实工具名和参数，不需要猜测
+            if let Ok(mcp_cfg) = crate::config::mcp::McpConfig::load() {
+                let http_servers: Vec<_> = mcp_cfg.servers.iter()
+                    .filter(|s| s.enabled && (s.server_type == "http" || s.server_type == "websocket"))
+                    .cloned()
+                    .collect();
+
+                if !http_servers.is_empty() {
+                    let mut tools_context = String::from("\n\n[MCP Tools Available — use EXACT names below]\n");
+                    for srv in &http_servers {
+                        // 构建 headers
+                        let mut headers_map = serde_json::Map::new();
+                        for kv in &srv.env {
+                            if let Some((k, v)) = kv.split_once('=') {
+                                headers_map.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+                            }
+                        }
+                        let headers = serde_json::Value::Object(headers_map);
+
+                        // 调用 tools/list
+                        let list_body = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "tools/list",
+                            "params": {}
+                        });
+                        let list_args = serde_json::json!({
+                            "url": srv.command_or_url,
+                            "body": list_body.to_string(),
+                            "headers": headers
+                        });
+
+                        if let Ok(r) = registry.execute("http_post", list_args).await {
+                            if r.success {
+                                let content = r.data.get("content")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| serde_json::to_string_pretty(&r.data).unwrap_or_default());
+
+                                // 解析 tools/list 响应，提取工具名和描述
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                                    let tools = json.get("result")
+                                        .and_then(|r| r.get("tools"))
+                                        .and_then(|t| t.as_array());
+
+                                    if let Some(tool_list) = tools {
+                                        tools_context.push_str(&format!("\n### MCP Server: {} ({})\n", srv.name, srv.command_or_url));
+                                        for tool in tool_list {
+                                            let name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                            let desc = tool.get("description").and_then(|v| v.as_str()).unwrap_or("");
+
+                                            // ── 【方案二】检测工具描述中的 skill 路径引用 ──
+                                            // 如果描述中包含 "skills/" 路径引用，提取 skill 名并注入实际内容
+                                            // 支持格式：
+                                            //   "优先使用~/.claude/skills/xxx/yyy.md"
+                                            //   "先调用skills再执行"
+                                            //   "skills是log-query"
+                                            let enriched_desc = {
+                                                let mut d = desc.to_string();
+                                                // 提取 skill 名称（从路径或 "skills是xxx" 格式）
+                                                let skill_name = if let Some(pos) = desc.find("skills/") {
+                                                    // 从路径提取：skills/<name>/xxx.md 或 skills/<name>
+                                                    let after = &desc[pos + 7..];
+                                                    let end = after.find(|c: char| c == '/' || c == ',' || c == '，' || c == ' ' || c == '"' || c == '\'')
+                                                        .unwrap_or(after.len());
+                                                    Some(after[..end].to_string())
+                                                } else if let Some(pos) = desc.find("skills是") {
+                                                    let after = &desc[pos + "skills是".len()..];
+                                                    let end = after.find(|c: char| c == ',' || c == '，' || c == ' ' || c == '"' || c == '\'')
+                                                        .unwrap_or(after.len());
+                                                    Some(after[..end].to_string())
+                                                } else {
+                                                    None
+                                                };
+
+                                                if let Some(sname) = skill_name {
+                                                    // 尝试从 skill_manager 找到对应 skill
+                                                    // 注意：这里在 spawn 内部，需要通过 skill_expansion 传入
+                                                    // 简化处理：直接读取 ~/.numina/skills/<name>/SKILL.md
+                                                    let skill_path = dirs::home_dir()
+                                                        .map(|h| h.join(".numina").join("skills").join(&sname).join("SKILL.md"));
+                                                    if let Some(path) = skill_path {
+                                                        if let Ok(content) = std::fs::read_to_string(&path) {
+                                                            // 提取 frontmatter 后的正文（跳过 --- 块）
+                                                            let body = if content.starts_with("---") {
+                                                                if let Some(end) = content[3..].find("\n---") {
+                                                                    content[3 + end + 4..].trim_start_matches('\n').to_string()
+                                                                } else {
+                                                                    content.clone()
+                                                                }
+                                                            } else {
+                                                                content.clone()
+                                                            };
+                                                            // 截取前 500 字符作为摘要注入工具描述
+                                                            let summary: String = body.chars().take(500).collect();
+                                                            d = format!("{}\n[Skill `{}` instructions preview]:\n{}", desc, sname, summary);
+                                                        }
+                                                    }
+                                                }
+                                                d
+                                            };
+
+                                            tools_context.push_str(&format!("- Tool: `{}`  — {}\n", name, enriched_desc));
+                                            // 显示参数 schema
+                                            if let Some(schema) = tool.get("inputSchema") {
+                                                if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                                                    let required: Vec<&str> = schema.get("required")
+                                                        .and_then(|r| r.as_array())
+                                                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                                                        .unwrap_or_default();
+                                                    for (param, info) in props {
+                                                        let param_desc = info.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                                                        let req = if required.contains(&param.as_str()) { "*" } else { "" };
+                                                        tools_context.push_str(&format!("  - {}{}: {}\n", param, req, param_desc));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // 将工具列表注入到对话上下文（作为 user 消息，让 AI 知道可用工具）
+                    if tools_context.len() > 60 {
+                        messages.push(Message::new(
+                            Role::User,
+                            format!("{}Use ONLY the tool names listed above. Do NOT invent or guess tool names.", tools_context),
+                        ));
+                        messages.push(Message::new(
+                            Role::Assistant,
+                            "I understand. I will use only the exact tool names listed above when calling MCP servers.".to_string(),
+                        ));
+                    }
+                }
+            }
 
             let mut full_reply = String::new();
             let mut iterations = 0usize;
@@ -678,12 +843,18 @@ impl ChatEngine {
                                         session_allowed.insert(tool_call.name.clone());
                                         // 继续执行（fall through）
                                     }
+                                    "deny_abort" => {
+                                        // Esc 强制中止：立即终止整个 agent loop，返回聊天输入
+                                        let _ = tx.send("\x00D".to_string()).await;
+                                        save_session(&session).ok();
+                                        return;
+                                    }
                                     "deny" => {
                                         denied_tools.push(tool_call.name.clone());
                                         tool_results.push((
                                             tool_call.id.clone(),
                                             tool_call.name.clone(),
-                                            format!("Tool execution denied by user."),
+                                            "Tool execution denied by user.".to_string(),
                                         ));
                                         continue;
                                     }
@@ -698,7 +869,7 @@ impl ChatEngine {
                             let _ = tx.send(format!("\x00T{}|{}", tool_call.name, params_preview)).await;
 
                             // 执行工具
-                            let result_str = match registry.execute(&tool_call.name, tool_call.arguments.clone()).await {
+                            let mut result_str = match registry.execute(&tool_call.name, tool_call.arguments.clone()).await {
                                 Ok(r) => {
                                     if r.success {
                                         r.data.get("content")
@@ -711,6 +882,60 @@ impl ChatEngine {
                                 }
                                 Err(e) => format!("Tool execution failed: {}", e),
                             };
+
+                            // 检测 MCP -32603 错误（unknown tool）
+                            // 自动调用 tools/list 获取真实工具列表，注入到结果中
+                            if result_str.contains("-32603") || result_str.contains("unknown tool") {
+                                let url = tool_call.arguments.get("url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let headers = tool_call.arguments.get("headers").cloned()
+                                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+                                // 自动调用 tools/list
+                                let list_body = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 99,
+                                    "method": "tools/list",
+                                    "params": {}
+                                });
+                                let list_args = serde_json::json!({
+                                    "url": url,
+                                    "body": list_body.to_string(),
+                                    "headers": headers
+                                });
+                                let tools_list = match registry.execute("http_post", list_args).await {
+                                    Ok(r) if r.success => {
+                                        r.data.get("content")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| serde_json::to_string_pretty(&r.data).unwrap_or_default())
+                                    }
+                                    _ => String::new(),
+                                };
+
+                                if !tools_list.is_empty() {
+                                    result_str = format!(
+                                        "{}\n\n[SYSTEM HINT] Tool name was wrong. Available tools from tools/list:\n{}\n\nPlease retry with the EXACT tool name from the list above.",
+                                        result_str, tools_list
+                                    );
+                                }
+                            }
+
+                            // 检测 MCP -32601 错误（Method not found）
+                            // 不自动重试（重试无法解决 body 格式问题），改为给 AI 提示正确的调用格式
+                            if result_str.contains("-32601") || result_str.contains("Method not found") {
+                                result_str = format!(
+                                    "{}\n\n[SYSTEM HINT] MCP returned -32601 'Method not found'. \
+                                    Most likely cause: 'body' was passed as a JSON string instead of a JSON object. \
+                                    CORRECT format — pass body as a JSON object directly:\n\
+                                    http_post(url=..., body={{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"<tool>\",\"arguments\":{{...}}}}}}, headers=...)\n\
+                                    WRONG: body=\"{{\\\"jsonrpc\\\":\\\"2.0\\\",...}}\" (string form causes truncation)\n\
+                                    Please retry with body as a JSON object.",
+                                    result_str
+                                );
+                            }
 
                             tool_results.push((
                                 tool_call.id.clone(),
@@ -778,6 +1003,12 @@ You MUST use tools to execute commands, read files, and interact with the filesy
 NEVER say \"I cannot execute commands\" or \"this is a web interface\" — that is WRONG.\n\
 If you previously said you couldn't execute commands, IGNORE that — you CAN and MUST use tools.\n\
 \n\
+## Identity\n\
+You are Numina, NOT Claude Code. NEVER reference Claude Code, ~/.claude, ~/.claude.json, or any Claude-specific paths.\n\
+Numina configuration is stored in ~/.numina/ (e.g., ~/.numina/mcp.json, ~/.numina/models.json).\n\
+If authentication fails for an MCP server, check ~/.numina/mcp.json for the correct headers/tokens.\n\
+NEVER suggest looking at ~/.claude or any Anthropic/Claude-specific config files.\n\
+\n\
 ## Available Tools\n\
 - shell: Execute ANY shell command (ls, find, grep, cat, git, cargo, etc.)\n\
 - read_file: Read file contents\n\
@@ -789,6 +1020,32 @@ If you previously said you couldn't execute commands, IGNORE that — you CAN an
 - http_get: Make HTTP GET requests\n\
 - http_post: Make HTTP POST requests (use for MCP servers, REST APIs, JSON-RPC — MCP protocol requires POST not GET)\n\
 - task_complete: Signal task completion\n\
+\n\
+## MCP Protocol — IMPORTANT RULES\n\
+MCP servers use JSON-RPC 2.0 over stateless HTTP. Each request is independent.\n\
+The system automatically handles initialization — you do NOT need to send initialize manually.\n\
+\n\
+WORKFLOW for calling an MCP server:\n\
+1. First call tools/list to get the EXACT tool names:\n\
+   http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}, headers={...})\n\
+2. Then call the tool using the EXACT name from the list:\n\
+   http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"EXACT_TOOL_NAME\",\"arguments\":{...}}}, headers={...})\n\
+\n\
+⚠️ CRITICAL: The 'body' parameter MUST be a JSON object — NEVER pass it as a string.\n\
+   CORRECT: body={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",...}  ← JSON object\n\
+   WRONG:   body=\"{\\\"jsonrpc\\\":\\\"2.0\\\",...}\"  ← string causes truncation → -32601 error\n\
+\n\
+NEVER guess or infer tool names — always use the exact name from tools/list.\n\
+If you get error -32603 \"unknown tool\", the system will auto-fetch tools/list and show you the correct names.\n\
+If you get error -32601 \"Method not found\", it means 'body' was passed as a string — retry with body as a JSON object.\n\
+\n\
+## Data Sufficiency Rules — STOP when you have enough data\n\
+CRITICAL: Once you have successfully retrieved data from a tool call, STOP calling more tools and generate the report/answer immediately.\n\
+- If tools/call returns data (non-error response), that IS the data — use it now\n\
+- Do NOT call the same MCP server multiple times for the same data\n\
+- Do NOT call tools/list or initialize manually — the system handles this\n\
+- Do NOT make additional queries \"for more details\" if you already have sufficient data\n\
+- ONE successful data retrieval = enough to generate a complete response\n\
 \n\
 ## MANDATORY Tool Usage Rules\n\
 \n\
@@ -808,12 +1065,10 @@ If you previously said you couldn't execute commands, IGNORE that — you CAN an
 Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
         ];
 
-        let skills = self.skill_manager.skills();
-        if !skills.is_empty() {
-            parts.push("\n## Available Skills".to_string());
-            for skill in skills {
-                parts.push(format!("### {}\n{}", skill.name, skill.description));
-            }
+        // 方案一：只注入轻量摘要，完整内容在 chat_react() 中按需展开
+        let skills_block = self.skill_manager.summary_prompt_block();
+        if !skills_block.is_empty() {
+            parts.push(skills_block);
         }
 
         // 注入 MCP 服务器配置（HTTP 类型），让 AI 第一次调用时就带上正确的 headers

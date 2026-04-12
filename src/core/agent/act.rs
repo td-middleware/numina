@@ -173,12 +173,9 @@ You have access to tools to help you complete tasks. Think step by step.\n\
         ),
     ];
 
-    let skills = skill_manager.skills();
-    if !skills.is_empty() {
-        parts.push("\n## Available Skills".to_string());
-        for skill in skills {
-            parts.push(format!("### {}\n{}", skill.name, skill.description));
-        }
+    let skills_block = skill_manager.auto_trigger_prompt_block();
+    if !skills_block.is_empty() {
+        parts.push(skills_block);
     }
 
     parts.join("\n")

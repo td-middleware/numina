@@ -255,7 +255,7 @@ impl ModelProvider for AnthropicProvider {
 
         let req_body = AnthropicRequest {
             model: &self.model,
-            max_tokens: 4096,
+            max_tokens: 16384,
             system,
             messages: turns,
             stream: None,
@@ -319,7 +319,7 @@ impl ModelProvider for AnthropicProvider {
 
         let req_body = AnthropicRequest {
             model: &self.model,
-            max_tokens: 4096,
+            max_tokens: 16384,
             system,
             messages: turns,
             stream: Some(true),
@@ -420,7 +420,7 @@ impl ModelProvider for AnthropicProvider {
 
         let req_body = AnthropicToolRequest {
             model: self.model.clone(),
-            max_tokens: 4096,
+            max_tokens: 16384,
             system,
             messages: turns,
             tools: ant_tools,
