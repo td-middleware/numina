@@ -200,6 +200,11 @@ pub fn print_help() {
     println!("  {}/mcp{}      {}List configured MCP servers{}", BOLD, RESET, GRAY, RESET);
     println!("  {}/skills{}   {}Show loaded skills count{}", BOLD, RESET, GRAY, RESET);
     println!("  {}/clear{}    {}Clear screen and show welcome{}", BOLD, RESET, GRAY, RESET);
+    println!("  {}/memory{}   {}List all memories{}", BOLD, RESET, GRAY, RESET);
+    println!("  {}/memory add <content>{}  {}Add a memory (global scope){}", BOLD, RESET, GRAY, RESET);
+    println!("  {}/memory add -p <content>{}  {}Add a project-scoped memory{}", BOLD, RESET, GRAY, RESET);
+    println!("  {}/memory forget <id>{}  {}Delete a memory by ID{}", BOLD, RESET, GRAY, RESET);
+    println!("  {}/memory search <query>{}  {}Search memories{}", BOLD, RESET, GRAY, RESET);
     println!("  {}/quit{}     {}Exit Numina{}", BOLD, RESET, GRAY, RESET);
     println!();
     println!("  {}Tip:{} Press {}Ctrl+D{} to exit, {}Ctrl+C{} to cancel input.",

@@ -311,25 +311,50 @@ fn render_server_list(
     servers.len() + 3  // 标题 + 上分隔 + 每个server + 下分隔
 }
 
-/// 渲染 tools 列表（内联），返回实际输出行数
+/// 计算每页可显示的工具数（统一逻辑，避免调用方和渲染函数不一致）
+fn tools_page_size(term_h: usize) -> usize {
+    let rows_per_tool = 2usize;
+    // 标题(1) + 上分隔(1) + 下分隔(1) + 页码提示(1) + 安全余量(4) = 8
+    // 安全余量确保列表不触发终端滚动
+    let header_lines = 8usize;
+    let available = term_h.saturating_sub(header_lines);
+    (available / rows_per_tool).max(3)
+}
+
+/// 根据 selected 计算 page_start（保证 selected 在当前页内）
+fn tools_page_start(selected: usize, tools_len: usize, term_h: usize) -> usize {
+    if tools_len == 0 { return 0; }
+    let page_size = tools_page_size(term_h);
+    (selected / page_size) * page_size
+}
+
+/// 渲染 tools 列表（cooked mode 下用 println! 渲染），返回实际输出行数
+/// 调用方负责在调用前用 \x1b[{}A\x1b[0J 清除上一次的输出
 fn render_tools_list(
     srv_name: &str,
     tools: &[ToolDisplay],
     selected: usize,
+    page_start: usize,
+    term_h: usize,
 ) -> usize {
-    println!("  {}{}{}\x1b[0m  {}› {} tools  {}↑↓ navigate · Enter detail · Esc back{}",
-        BOLD, BRIGHT_WHITE, srv_name,
-        GRAY, tools.len(), GRAY, RESET);
-    println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
+    let page_size = tools_page_size(term_h);
+    let page_end = (page_start + page_size).min(tools.len());
+    let page_tools = if tools.is_empty() { &tools[..] } else { &tools[page_start..page_end] };
 
-    let mut lines = 3usize; // 标题 + 上分隔 + 下分隔
+    let sep = "─".repeat(60);
+    println!("  {}{}{}\x1b[0m  {}› {} tools{}",
+        BOLD, BRIGHT_WHITE, srv_name, GRAY, tools.len(), RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
+
+    let mut lines = 3usize; // 标题 + 上分隔 + 下分隔（预计入）
 
     if tools.is_empty() {
         println!("  {}(no tools found or server not reachable){}", GRAY, RESET);
         lines += 1;
     } else {
-        for (i, (tname, tdesc, tparams)) in tools.iter().enumerate() {
-            let is_sel  = i == selected;
+        for (rel_i, (tname, tdesc, tparams)) in page_tools.iter().enumerate() {
+            let abs_i = page_start + rel_i;
+            let is_sel  = abs_i == selected;
             let sel_bg  = if is_sel { "\x1b[48;5;24m" } else { "" };
             let sel_rst = if is_sel { "\x1b[0m" } else { "" };
             let arrow   = if is_sel { "\x1b[97m▶\x1b[0m" } else { " " };
@@ -340,47 +365,64 @@ fn render_tools_list(
                 format!("{}{} params{}", GRAY, tparams.len(), RESET)
             };
 
-            println!(
-                "  {} {}\x1b[33m◆\x1b[0m{} {}{}{}  {}",
-                arrow, sel_bg, sel_rst,
-                BOLD, tname, RESET,
-                param_info,
-            );
+            println!("  {} {}\x1b[33m◆\x1b[0m{} {}{}{}  {}",
+                arrow, sel_bg, sel_rst, BOLD, tname, RESET, param_info);
             lines += 1;
-            if !tdesc.is_empty() {
-                let preview: String = tdesc.chars().take(68).collect();
-                let ellipsis = if tdesc.len() > 68 { "…" } else { "" };
+            // 取描述的第一行再截断，确保不含 \n，不引起 wrap → lines 计数准确
+            let first_line = tdesc.lines().next().unwrap_or("");
+            if !first_line.is_empty() {
+                let preview: String = first_line.chars().take(68).collect();
+                let ellipsis = if first_line.chars().count() > 68 || tdesc.contains('\n') { "…" } else { "" };
                 println!("       {}{}{}{}", DIM, preview, ellipsis, RESET);
-                lines += 1;
+            } else {
+                println!();
             }
+            lines += 1;
+        }
+        // 页码提示（多页时显示）
+        let total_pages = (tools.len() + page_size - 1) / page_size;
+        let cur_page = page_start / page_size + 1;
+        if total_pages > 1 {
+            println!("  {}  {}/{} pages  ({}-{} of {})  ↑↓ navigate{}",
+                GRAY, cur_page, total_pages, page_start + 1, page_end, tools.len(), RESET);
+            lines += 1;
         }
     }
-    println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
     lines
 }
 
-/// 渲染 tool 详情（内联），返回实际输出行数
-/// params 元素：(param_name, param_type, is_required, param_description)
+/// 渲染 tool 详情（cooked mode 下用 println! 渲染），返回实际输出行数
+/// 调用方负责在调用前用 \x1b[{}A\x1b[0J 清除上一次的输出
 fn render_tool_detail(
     srv_name: &str,
     tname: &str,
     tdesc: &str,
     params: &[(String, String, bool, String)],
 ) -> usize {
-    // 空行 + 标题行 + 上分隔线 = 3
-    let mut lines = 3usize;
-    println!();
+    let sep = "─".repeat(60);
     println!("  {}{}{}\x1b[0m  {}›\x1b[0m  {}{}{}\x1b[0m  {}Esc back{}",
-        BOLD, BRIGHT_WHITE, srv_name,
-        GRAY,
-        BOLD, "\x1b[33m", tname,
-        GRAY, RESET);
-    println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
+        BOLD, BRIGHT_WHITE, srv_name, GRAY, BOLD, "\x1b[33m", tname, GRAY, RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
+
+    let mut lines = 3usize; // 标题 + 上分隔 + 下分隔
 
     if !tdesc.is_empty() {
-        println!("  {}", tdesc);
-        println!();
-        lines += 2; // 描述行 + 空行
+        // 描述可能含 \n，按行拆分，每行单独打印并截断，确保 lines 计数准确
+        let desc_lines: Vec<&str> = tdesc.lines().collect();
+        let show_n = desc_lines.len().min(6);  // 最多显示 6 行描述
+        for l in desc_lines.iter().take(show_n) {
+            let s: String = l.chars().take(76).collect();
+            let e = if l.chars().count() > 76 { "…" } else { "" };
+            println!("  {}{}{}{}", DIM, s, e, RESET);
+            lines += 1;
+        }
+        if desc_lines.len() > show_n {
+            println!("  {}…{}", DIM, RESET);
+            lines += 1;
+        }
+        println!();  // 空行
+        lines += 1;
     }
 
     if params.is_empty() {
@@ -388,30 +430,34 @@ fn render_tool_detail(
         lines += 1;
     } else {
         println!("  {}Parameters:{}", BOLD, RESET);
-        lines += 1; // "Parameters:" 标题行
+        lines += 1;
         for (pname, ptype, req, pdesc) in params {
             let req_label = if *req {
                 "\x1b[31mrequired\x1b[0m".to_string()
             } else {
                 format!("{}optional{}", GRAY, RESET)
             };
-            if pdesc.is_empty() {
+            // 参数描述取第一行再截断，避免 \n 或 wrap 导致行数不匹配
+            let pdesc_line = pdesc.lines().next().unwrap_or("");
+            let pdesc_short: String = pdesc_line.chars().take(55).collect();
+            let pdesc_e = if pdesc_line.chars().count() > 55 || pdesc.contains('\n') { "…" } else { "" };
+            if pdesc_short.is_empty() {
                 println!("    \x1b[96m•\x1b[0m \x1b[97m{}\x1b[0m: {}{}\x1b[0m  {}",
                     pname, GRAY, ptype, req_label);
             } else {
-                println!("    \x1b[96m•\x1b[0m \x1b[97m{}\x1b[0m: {}{}\x1b[0m  {}  {}{}\x1b[0m",
-                    pname, GRAY, ptype, req_label, DIM, pdesc);
+                println!("    \x1b[96m•\x1b[0m \x1b[97m{}\x1b[0m: {}{}\x1b[0m  {}  {}{}{}\x1b[0m",
+                    pname, GRAY, ptype, req_label, DIM, pdesc_short, pdesc_e);
             }
             lines += 1;
         }
     }
-    println!("  {}{}{}", GRAY, "─".repeat(60), RESET);
-    lines + 1 // +1 for 下分隔线
+    println!("  {}{}{}", GRAY, sep, RESET);
+    lines
 }
 
 /// 等待键盘事件（raw mode 下）
 fn wait_key() -> Option<crossterm::event::KeyCode> {
-    use crossterm::event::{read, Event, KeyEvent, KeyModifiers};
+    use crossterm::event::{read, Event, KeyEvent};
     loop {
         match read() {
             Ok(Event::Key(KeyEvent { code, modifiers, .. })) => {
@@ -429,8 +475,12 @@ fn wait_key() -> Option<crossterm::event::KeyCode> {
 }
 
 /// /mcp 内联交互式浏览器：↑↓ 导航，Enter 进入，Esc 返回
+/// 内嵌在当前终端位置渲染，不使用 alternate screen。
+/// 技术：先向下打印 tui_reserve 个空行腾出视口空间，再 \x1b[NA 向上复位，
+/// 之后所有重绘用相对行数 \x1b[{N}A\x1b[0J 清除，不再依赖绝对坐标。
 pub async fn cmd_mcp_browser() -> Result<()> {
     use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+    use crossterm::event::KeyCode;
 
     let cfg = match McpFileConfig::load() {
         Ok(c) => c,
@@ -451,7 +501,6 @@ pub async fn cmd_mcp_browser() -> Result<()> {
     // ── 检测连接状态 ──
     print!("  {}Checking connections…{}", DIM, RESET);
     std::io::stdout().flush()?;
-
     let mut connected: Vec<bool> = Vec::with_capacity(servers.len());
     for srv in servers.iter() {
         connected.push(if srv.enabled { check_server_connected(srv).await } else { false });
@@ -459,38 +508,50 @@ pub async fn cmd_mcp_browser() -> Result<()> {
     print!("\r\x1b[2K");
     std::io::stdout().flush()?;
 
+    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+
+    // ── 预留 TUI 渲染空间 ──
+    // 先向下打印 tui_reserve 个空行，使视口下方有足够空间；
+    // 再 \x1b[NA 向上移动复位，\x1b[0J 清除从光标到底部（清除预留空行）。
+    // 此后无论渲染多少行都不会触发终端滚动，相对行数清除因此可靠工作。
+    let tool_max_lines = tools_page_size(term_h) * 2 + 6;
+    let srv_max_lines = servers.len() + 3;
+    let tui_reserve = tool_max_lines.max(srv_max_lines).min(term_h.saturating_sub(2));
+    for _ in 0..tui_reserve { println!(); }
+    print!("\x1b[{}A\x1b[0J", tui_reserve);
+    std::io::stdout().flush()?;
+
     // ── 服务列表层 ──
     let mut srv_sel = 0usize;
     let mut srv_lines = render_server_list(&servers, &connected, srv_sel);
+    std::io::stdout().flush()?;
 
     enable_raw_mode()?;
 
     'srv_loop: loop {
         match wait_key() {
-            Some(crossterm::event::KeyCode::Esc) | Some(crossterm::event::KeyCode::Char('q')) => {
-                break 'srv_loop;
-            }
-            Some(crossterm::event::KeyCode::Up) => {
-                if srv_sel > 0 { srv_sel -= 1; } else { srv_sel = servers.len().saturating_sub(1); }
+            Some(KeyCode::Esc) | Some(KeyCode::Char('q')) => break 'srv_loop,
+            Some(KeyCode::Up) => {
+                srv_sel = if srv_sel > 0 { srv_sel - 1 } else { servers.len().saturating_sub(1) };
                 disable_raw_mode()?;
                 print!("\x1b[{}A\x1b[0J", srv_lines);
-                std::io::stdout().flush()?;
                 srv_lines = render_server_list(&servers, &connected, srv_sel);
+                std::io::stdout().flush()?;
                 enable_raw_mode()?;
             }
-            Some(crossterm::event::KeyCode::Down) => {
+            Some(KeyCode::Down) => {
                 srv_sel = (srv_sel + 1) % servers.len();
                 disable_raw_mode()?;
                 print!("\x1b[{}A\x1b[0J", srv_lines);
-                std::io::stdout().flush()?;
                 srv_lines = render_server_list(&servers, &connected, srv_sel);
+                std::io::stdout().flush()?;
                 enable_raw_mode()?;
             }
-            Some(crossterm::event::KeyCode::Enter) => {
-                disable_raw_mode()?;
-
+            Some(KeyCode::Enter) => {
                 let srv = &servers[srv_sel];
-                println!();
+                disable_raw_mode()?;
+                // 清除服务列表，显示加载提示
+                print!("\x1b[{}A\x1b[0J", srv_lines);
                 print!("  {}⏳ Fetching tools from {}…{}", DIM, srv.name, RESET);
                 std::io::stdout().flush()?;
 
@@ -499,67 +560,66 @@ pub async fn cmd_mcp_browser() -> Result<()> {
                     .await
                     .unwrap_or_default();
 
-                // 清除加载行（⏳ 那一行 + 上面的空行）
-                print!("\r\x1b[2K\x1b[1A\r\x1b[2K");
-                std::io::stdout().flush()?;
-
-                // 清除服务列表，切换到 tools 列表
-                print!("\x1b[{}A\x1b[0J", srv_lines);
-                std::io::stdout().flush()?;
-
                 let srv_name = srv.name.clone();
                 let mut tool_sel = 0usize;
-                let mut tool_lines = render_tools_list(&srv_name, &tools, tool_sel);
+                let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+                let mut page_start = tools_page_start(tool_sel, tools.len(), th);
 
+                // 清除加载提示行，渲染工具列表
+                print!("\r\x1b[2K");
+                let mut tool_lines = render_tools_list(&srv_name, &tools, tool_sel, page_start, th);
+                std::io::stdout().flush()?;
                 enable_raw_mode()?;
 
                 // ── Tools 列表层 ──
                 'tools_loop: loop {
                     match wait_key() {
-                        Some(crossterm::event::KeyCode::Esc) => {
+                        Some(KeyCode::Esc) => {
                             disable_raw_mode()?;
-                            // 清除 tools 列表，重绘服务列表
                             print!("\x1b[{}A\x1b[0J", tool_lines);
-                            std::io::stdout().flush()?;
                             srv_lines = render_server_list(&servers, &connected, srv_sel);
+                            std::io::stdout().flush()?;
                             enable_raw_mode()?;
                             break 'tools_loop;
                         }
-                        Some(crossterm::event::KeyCode::Up) if !tools.is_empty() => {
-                            if tool_sel > 0 { tool_sel -= 1; } else { tool_sel = tools.len().saturating_sub(1); }
+                        Some(KeyCode::Up) if !tools.is_empty() => {
+                            tool_sel = if tool_sel > 0 { tool_sel - 1 } else { tools.len().saturating_sub(1) };
+                            let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+                            page_start = tools_page_start(tool_sel, tools.len(), th);
                             disable_raw_mode()?;
                             print!("\x1b[{}A\x1b[0J", tool_lines);
+                            tool_lines = render_tools_list(&srv_name, &tools, tool_sel, page_start, th);
                             std::io::stdout().flush()?;
-                            tool_lines = render_tools_list(&srv_name, &tools, tool_sel);
                             enable_raw_mode()?;
                         }
-                        Some(crossterm::event::KeyCode::Down) if !tools.is_empty() => {
+                        Some(KeyCode::Down) if !tools.is_empty() => {
                             tool_sel = (tool_sel + 1) % tools.len();
+                            let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+                            page_start = tools_page_start(tool_sel, tools.len(), th);
                             disable_raw_mode()?;
                             print!("\x1b[{}A\x1b[0J", tool_lines);
+                            tool_lines = render_tools_list(&srv_name, &tools, tool_sel, page_start, th);
                             std::io::stdout().flush()?;
-                            tool_lines = render_tools_list(&srv_name, &tools, tool_sel);
                             enable_raw_mode()?;
                         }
-                        Some(crossterm::event::KeyCode::Enter) if !tools.is_empty() => {
-                            disable_raw_mode()?;
+                        Some(KeyCode::Enter) if !tools.is_empty() => {
                             let (tname, tdesc, tparams) = &tools[tool_sel];
-                            // 清除 tools 列表，显示详情
+                            disable_raw_mode()?;
                             print!("\x1b[{}A\x1b[0J", tool_lines);
+                            let mut detail_lines = render_tool_detail(&srv_name, tname, tdesc, tparams);
                             std::io::stdout().flush()?;
-                            let detail_lines = render_tool_detail(&srv_name, tname, tdesc, tparams);
-
                             enable_raw_mode()?;
 
-                            // ── Tool 详情层：等待 Esc 返回 ──
+                            // ── Tool 详情层：等待 Esc 返回工具列表 ──
                             loop {
                                 match wait_key() {
-                                    Some(crossterm::event::KeyCode::Esc) => {
+                                    Some(KeyCode::Esc) => {
+                                        let th = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+                                        page_start = tools_page_start(tool_sel, tools.len(), th);
                                         disable_raw_mode()?;
-                                        // 清除详情，重绘 tools 列表
                                         print!("\x1b[{}A\x1b[0J", detail_lines);
+                                        tool_lines = render_tools_list(&srv_name, &tools, tool_sel, page_start, th);
                                         std::io::stdout().flush()?;
-                                        tool_lines = render_tools_list(&srv_name, &tools, tool_sel);
                                         enable_raw_mode()?;
                                         break;
                                     }

@@ -10,6 +10,8 @@ mod core;
 mod config;
 // Shared utilities (logger, fs helpers, etc.)
 mod utils;
+// Memory — 跨会话持久化记忆
+mod memory;
 
 #[derive(Parser)]
 #[command(name = "numina")]

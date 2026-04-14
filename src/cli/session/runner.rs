@@ -10,7 +10,7 @@ use super::permission::{read_permission_choice_interactive, read_permission_choi
 use super::readline::{interactive_readline, ReadLine};
 use super::renderer::{
     estimate_context_size, print_context_bar, print_help, print_welcome,
-    BOLD, CODE_BG, CODE_FG, CYAN, DIM, GRAY, GREEN, RESET, YELLOW,
+    BOLD, BRIGHT_WHITE, CODE_BG, CODE_FG, CYAN, DIM, GRAY, GREEN, RESET, YELLOW,
 };
 
 use crate::cli::chat::{ChatArgs, ChatCommand};
@@ -606,6 +606,95 @@ pub async fn run_interactive_with_session(
             }
             "/mcp" => {
                 cmd_mcp_browser().await?;
+                continue;
+            }
+            "/memory" => {
+                // 列出所有记忆
+                let all = crate::memory::MemoryStore::load_all();
+                if all.is_empty() {
+                    println!("  {}No memories yet. Use /memory add <content> to add one.{}", GRAY, RESET);
+                } else {
+                    println!();
+                    println!("  {}{}Memories ({} total){}", BOLD, BRIGHT_WHITE, all.len(), RESET);
+                    println!("  {}{}{}", GRAY, "─".repeat(40), RESET);
+                    for entry in &all {
+                        let scope_color = match entry.scope {
+                            crate::memory::MemoryScope::Global => CYAN,
+                            crate::memory::MemoryScope::Project => GREEN,
+                        };
+                        let source_tag = match entry.source {
+                            crate::memory::MemorySource::User => "user",
+                            crate::memory::MemorySource::Auto => "auto",
+                        };
+                        let scope_tag = match entry.scope {
+                            crate::memory::MemoryScope::Global => "global",
+                            crate::memory::MemoryScope::Project => "project",
+                        };
+                        println!("  {}[{}]{} {}{}{}  {}{}[{}/{}]{}",
+                            scope_color, entry.id, RESET,
+                            BOLD, entry.content, RESET,
+                            DIM, GRAY, scope_tag, source_tag, RESET);
+                    }
+                }
+                println!();
+                continue;
+            }
+            _ if input.starts_with("/memory ") => {
+                let rest = input.trim_start_matches("/memory ").trim();
+                if rest.starts_with("add ") {
+                    let content_part = rest.trim_start_matches("add ").trim();
+                    // 支持 -p 标志表示项目级记忆
+                    let (scope, content) = if content_part.starts_with("-p ") {
+                        (crate::memory::MemoryScope::Project, content_part.trim_start_matches("-p ").trim())
+                    } else {
+                        (crate::memory::MemoryScope::Global, content_part)
+                    };
+                    if content.is_empty() {
+                        println!("  {}Usage: /memory add [-p] <content>{}", YELLOW, RESET);
+                    } else {
+                        let entry = crate::memory::MemoryEntry::new(
+                            content,
+                            crate::memory::MemorySource::User,
+                            scope,
+                        );
+                        let id = entry.id.clone();
+                        match crate::memory::MemoryStore::add(entry) {
+                            Ok(_) => println!("  {}✅ Memory saved [{}]: {}{}", GREEN, id, content, RESET),
+                            Err(e) => println!("  {}❌ Failed to save memory: {}{}", YELLOW, e, RESET),
+                        }
+                    }
+                } else if rest.starts_with("forget ") {
+                    let id = rest.trim_start_matches("forget ").trim();
+                    if id.is_empty() {
+                        println!("  {}Usage: /memory forget <id>{}", YELLOW, RESET);
+                    } else {
+                        match crate::memory::MemoryStore::remove(id) {
+                            Ok(true) => println!("  {}✅ Memory [{}] deleted.{}", GREEN, id, RESET),
+                            Ok(false) => println!("  {}No memory found with id: {}{}", YELLOW, id, RESET),
+                            Err(e) => println!("  {}❌ Failed to delete memory: {}{}", YELLOW, e, RESET),
+                        }
+                    }
+                } else if rest.starts_with("search ") {
+                    let query = rest.trim_start_matches("search ").trim();
+                    let results = crate::memory::search_memories(query, 10);
+                    if results.is_empty() {
+                        println!("  {}No memories found for: \"{}\"{}", GRAY, query, RESET);
+                    } else {
+                        println!();
+                        println!("  {}{}Search results for \"{}\" ({} found){}", BOLD, BRIGHT_WHITE, query, results.len(), RESET);
+                        println!("  {}{}{}", GRAY, "─".repeat(40), RESET);
+                        for entry in &results {
+                            let scope_color = match entry.scope {
+                                crate::memory::MemoryScope::Global => CYAN,
+                                crate::memory::MemoryScope::Project => GREEN,
+                            };
+                            println!("  {}[{}]{} {}{}{}", scope_color, entry.id, RESET, BOLD, entry.content, RESET);
+                        }
+                    }
+                } else {
+                    println!("  {}Unknown memory command. Try: /memory add <content> | /memory forget <id> | /memory search <query>{}", YELLOW, RESET);
+                }
+                println!();
                 continue;
             }
             "/clear" => {

@@ -257,12 +257,24 @@ impl ChatEngine {
         Ok(Self { config, skill_manager })
     }
 
-    /// 构建 system prompt（包含 skills 摘要，方案一：轻量注入）
+    /// 构建 system prompt（包含 skills 摘要 + 记忆注入）
     fn build_system_prompt(&self) -> String {
+        self.build_system_prompt_with_query("")
+    }
+
+    /// 构建 system prompt（带查询词，用于相关记忆检索）
+    fn build_system_prompt_with_query(&self, query: &str) -> String {
         let mut parts = vec![
             "You are Numina, an AI coding assistant. You help developers write, review, debug, and understand code.".to_string(),
             "Be concise, accurate, and helpful. When writing code, prefer idiomatic patterns.".to_string(),
         ];
+
+        // 注入记忆（如果有）
+        let memory_block = crate::memory::build_memory_prompt(query);
+        if !memory_block.is_empty() {
+            parts.push(String::new());
+            parts.push(memory_block);
+        }
 
         // 方案一：只注入轻量摘要（~50 tokens/skill），完整内容按需展开
         let skills_block = self.skill_manager.summary_prompt_block();

@@ -21,6 +21,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model",    "显示当前模型"),
     ("/mcp",      "列出已配置的 MCP 服务"),
     ("/skills",   "显示已加载的 skills"),
+    ("/memory",   "列出/管理记忆"),
     ("/clear",    "清屏"),
     ("/quit",     "退出 Numina"),
 ];
