@@ -519,16 +519,20 @@ pub async fn run_interactive_with_session(
         let input = match interactive_readline(prompt, &mut chat_history) {
             Ok(ReadLine::Line(line)) => {
                 let trimmed = line.trim().to_string();
+                // readline 已在内部将序列化历史格式推入 chat_history，
+                // 此处只需把最后一条（序列化格式）追加写到历史文件
                 if !trimmed.is_empty() {
-                    chat_history.push(trimmed.clone());
-                    if let Some(parent) = history_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                    if let Some(serialized) = chat_history.last() {
+                        let serialized = serialized.clone();
+                        if let Some(parent) = history_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        let _ = std::fs::OpenOptions::new()
+                            .append(true)
+                            .create(true)
+                            .open(&history_path)
+                            .and_then(|mut f| writeln!(f, "{}", serialized));
                     }
-                    let _ = std::fs::OpenOptions::new()
-                        .append(true)
-                        .create(true)
-                        .open(&history_path)
-                        .and_then(|mut f| writeln!(f, "{}", trimmed));
                 }
                 trimmed
             }
