@@ -17,6 +17,53 @@ use async_trait::async_trait;
 use serde_json::json;
 
 // ─────────────────────────────────────────────
+// 路径修正：将模型猜测的错误路径修正为实际可用路径
+// ─────────────────────────────────────────────
+
+/// 修正文件路径：
+/// - 如果路径以 `~` 开头，展开为 home 目录
+/// - 如果路径是绝对路径但父目录不存在（如 /home/user/...），
+///   提取文件名，重定向到当前工作目录
+/// - 相对路径直接返回（相对于 cwd，OS 会自动处理）
+fn resolve_path(path: &str) -> String {
+    use std::path::Path;
+
+    // 展开 ~ 前缀
+    let expanded = if path == "~" {
+        std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        format!("{}/{}", home, rest)
+    } else {
+        path.to_string()
+    };
+
+    let p = Path::new(&expanded);
+
+    // 相对路径直接返回
+    if p.is_relative() {
+        return expanded;
+    }
+
+    // 绝对路径：检查父目录是否存在
+    // 如果父目录不存在，说明是模型猜测的错误路径（如 /home/user/）
+    // 提取文件名，重定向到当前工作目录
+    if let Some(parent) = p.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            // 父目录不存在：取文件名，放到 cwd
+            if let Some(filename) = p.file_name() {
+                let cwd = std::env::current_dir()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+                return format!("{}/{}", cwd, filename.to_string_lossy());
+            }
+        }
+    }
+
+    expanded
+}
+
+// ─────────────────────────────────────────────
 // read_file
 // ─────────────────────────────────────────────
 
@@ -25,9 +72,11 @@ pub struct ReadFileTool;
 #[async_trait]
 impl ToolExecutor for ReadFileTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = params["path"]
+        let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("read_file: missing 'path' parameter"))?;
+        let path = resolve_path(raw_path);
+        let path = path.as_str();
 
         let max_lines = params["max_lines"].as_u64().unwrap_or(500) as usize;
         let start_line = params["start_line"].as_u64().map(|n| n as usize);
@@ -103,9 +152,11 @@ pub struct WriteFileTool;
 #[async_trait]
 impl ToolExecutor for WriteFileTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = params["path"]
+        let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("write_file: missing 'path' parameter"))?;
+        let path = resolve_path(raw_path);
+        let path = path.as_str();
         let content = params["content"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("write_file: missing 'content' parameter"))?;
@@ -160,9 +211,11 @@ pub struct EditFileTool;
 #[async_trait]
 impl ToolExecutor for EditFileTool {
     async fn execute(&self, params: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let path = params["path"]
+        let raw_path = params["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("edit_file: missing 'path' parameter"))?;
+        let path = resolve_path(raw_path);
+        let path = path.as_str();
         let search = params["search"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("edit_file: missing 'search' parameter"))?;
@@ -293,6 +346,238 @@ impl ToolExecutor for ListDirTool {
     }
 }
 
+/// 判断 URL 是否为需要用户操作的授权链接（OAuth、设备授权等）
+/// 过滤掉普通文档链接、帮助页面等
+fn is_auth_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    // 必须包含授权相关关键词
+    lower.contains("oauth") ||
+    lower.contains("authen") ||
+    lower.contains("/auth") ||
+    lower.contains("device/verify") ||
+    lower.contains("flow_id") ||
+    lower.contains("user_code") ||
+    lower.contains("authorize") ||
+    lower.contains("login") && lower.contains("feishu") ||
+    lower.contains("accounts.feishu") ||
+    lower.contains("accounts.larksuite")
+}
+
+/// 去掉字符串中的 ANSI 转义序列，返回纯文本
+/// 用于实时打印命令输出时去掉颜色/光标控制码
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // ESC 序列：跳过直到序列结束
+            match chars.peek() {
+                Some(&'[') => {
+                    chars.next(); // 跳过 '['
+                    // CSI 序列：跳过直到字母（序列终止符）
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() { break; }
+                    }
+                }
+                Some(&']') => {
+                    chars.next(); // 跳过 ']'
+                    // OSC 序列：跳过直到 BEL 或 ST
+                    loop {
+                        match chars.next() {
+                            None | Some('\x07') => break,
+                            Some('\x1b') => {
+                                if chars.peek() == Some(&'\\') { chars.next(); }
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {} // 其他 ESC 序列，跳过
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+/// 从一行文本中提取干净的 URL（去掉末尾标点）
+fn extract_url_from_line(line: &str) -> Option<String> {
+    let pos = line.find("https://")?;
+    let url_part = &line[pos..];
+    // 截取到第一个空白字符
+    let end = url_part.find(|c: char| c.is_whitespace()).unwrap_or(url_part.len());
+    let raw = &url_part[..end];
+    // 去掉末尾的标点符号（引号、逗号、句号、括号等）
+    let clean = raw.trim_end_matches(|c: char| matches!(c, '"' | '\'' | ',' | '.' | ')' | '>' | ']' | ';'));
+    if clean.len() < 10 { return None; }
+    Some(clean.to_string())
+}
+
+/// 检测到 URL 时显示给用户，并提供一键打开浏览器的选项
+/// 用于 lark-cli auth login 等需要用户在浏览器中完成操作的命令
+/// is_auth: true 表示授权链接（显示"需要浏览器授权"），false 表示普通链接
+/// 注意：此函数必须在 spawn_blocking 中调用，因为 crossterm::event::read() 是阻塞调用
+fn show_url_and_open(url: &str, is_auth: bool) {
+    use std::io::Write;
+    use crossterm::event::{read as ev_read, Event, KeyCode, KeyEvent};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    println!();
+    if is_auth {
+        println!("  \x1b[36m╭─ 🔗 需要浏览器授权 ────────────────────────────────\x1b[0m");
+    } else {
+        println!("  \x1b[36m╭─ 🔗 检测到链接 ────────────────────────────────────\x1b[0m");
+    }
+    println!("  \x1b[36m│\x1b[0m");
+    println!("  \x1b[36m│\x1b[0m  \x1b[1m\x1b[97m{}\x1b[0m", url);
+    println!("  \x1b[36m│\x1b[0m");
+    println!("  \x1b[36m│\x1b[0m  \x1b[2m按 \x1b[0m\x1b[1mEnter\x1b[0m\x1b[2m 自动打开浏览器，或 \x1b[0m\x1b[1mEsc\x1b[0m\x1b[2m 跳过\x1b[0m");
+    println!("  \x1b[36m╰────────────────────────────────────────────────────\x1b[0m");
+    println!();
+    std::io::stdout().flush().ok();
+
+    // 确保 raw mode 在退出时一定被关闭（即使发生 panic）
+    let open = {
+        let _ = enable_raw_mode();
+        let result = loop {
+            match ev_read() {
+                Ok(Event::Key(KeyEvent { code: KeyCode::Enter, .. })) => break true,
+                Ok(Event::Key(KeyEvent { code: KeyCode::Esc, .. })) => break false,
+                Ok(Event::Key(KeyEvent { code: KeyCode::Char('o'), .. })) => break true,
+                Ok(Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })) => break false,
+                Err(_) => break false, // 读取失败时跳过
+                _ => {}
+            }
+        };
+        let _ = disable_raw_mode();
+        result
+    };
+
+    if open {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+        if is_auth {
+            println!("  \x1b[32m✅ 已在浏览器中打开，请完成授权后等待命令继续...\x1b[0m");
+        } else {
+            println!("  \x1b[32m✅ 已在浏览器中打开\x1b[0m");
+        }
+    } else {
+        println!("  \x1b[90m已跳过，可手动复制上方链接\x1b[0m");
+    }
+    println!();
+    std::io::stdout().flush().ok();
+}
+
+/// 判断命令是否为需要 TTY 的交互式命令
+/// 这类命令使用 TUI 选择菜单界面，必须继承终端 stdin/stdout/stderr
+/// 注意：lark-cli auth login 不在此列，它输出 URL 到 stdout，走流式读取 + URL 检测路径
+fn is_interactive_command(cmd: &str) -> bool {
+    // 匹配真正的 TUI 选择菜单命令（需要 TTY 的交互式界面）
+    // 规则：命令名后跟 init / setup / configure / wizard / tui 等子命令
+    let interactive_patterns = [
+        // lark-cli 配置初始化（TUI 选择菜单）
+        "lark-cli config init",
+        "lark config init",
+        // 通用 TUI 子命令模式
+        " init",       // 大多数 CLI 工具的 init 子命令都是交互式的
+        " setup",
+        " configure",
+        " wizard",
+        " tui",
+        " interactive",
+    ];
+    // 先检查精确前缀匹配（避免误判 "git init" 等）
+    let tui_exact = [
+        "lark-cli config init",
+        "lark config init",
+    ];
+    for pat in &tui_exact {
+        if cmd.contains(pat) {
+            return true;
+        }
+    }
+    // 检查是否为已知的 TUI 工具（这些工具的所有子命令都需要 TTY）
+    let tui_tools = [
+        "fzf", "gum", "charm", "bubbletea", "lazygit", "lazydocker",
+        "htop", "btop", "ncdu", "ranger", "nnn", "vifm",
+        "tig", "gitui", "delta --interactive",
+    ];
+    for tool in &tui_tools {
+        if cmd.starts_with(tool) || cmd.contains(&format!(" {}", tool)) {
+            return true;
+        }
+    }
+    let _ = interactive_patterns; // 避免 unused 警告
+    false
+}
+
+/// 以继承 TTY 的方式运行交互式命令（stdin/stdout/stderr 直接连接到终端）
+/// 命令的 TUI 界面会直接显示给用户，用户可以正常操作
+async fn run_interactive_command(
+    command: &str,
+    working_dir: &str,
+    timeout_secs: u64,
+) -> anyhow::Result<ToolResult> {
+    use tokio::process::Command as TokioCommand;
+
+    println!();
+    println!("  \x1b[36m╭─ 🖥  交互式命令 ─────────────────────────────────\x1b[0m");
+    println!("  \x1b[36m│\x1b[0m  \x1b[2m{}\x1b[0m", command);
+    println!("  \x1b[36m╰──────────────────────────────────────────────────\x1b[0m");
+    println!();
+
+    // 继承终端的 stdin/stdout/stderr，让命令直接与用户交互
+    let mut child = TokioCommand::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn interactive command: {}", e))?;
+
+    // 等待命令完成（带超时）
+    let deadline = std::time::Duration::from_secs(timeout_secs);
+    match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => {
+            let exit_code = status.code().unwrap_or(-1);
+            println!();
+            Ok(ToolResult {
+                success: status.success(),
+                data: json!({
+                    "content": if status.success() {
+                        format!("Interactive command completed successfully (exit code {})", exit_code)
+                    } else {
+                        format!("Interactive command exited with code {}", exit_code)
+                    },
+                    "exit_code": exit_code,
+                    "command": command,
+                    "interactive": true,
+                }),
+                error: if status.success() { None } else {
+                    Some(format!("Command exited with code {}", exit_code))
+                },
+            })
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("wait failed: {}", e)),
+        Err(_) => {
+            let _ = child.kill().await;
+            Ok(ToolResult {
+                success: false,
+                data: json!({
+                    "content": format!("Interactive command timed out after {}s", timeout_secs),
+                    "exit_code": -1,
+                    "command": command,
+                    "interactive": true,
+                }),
+                error: Some(format!("Interactive command timed out after {}s", timeout_secs)),
+            })
+        }
+    }
+}
+
 /// 需要跳过的目录名（构建产物、版本控制、依赖等）
 const SKIP_DIRS: &[&str] = &[
     "target", ".git", "node_modules", ".next", "dist", "build",
@@ -374,21 +659,125 @@ impl ToolExecutor for ShellTool {
         let working_dir = params["cwd"].as_str().unwrap_or(".");
         let timeout_secs = params["timeout"].as_u64().unwrap_or(30);
 
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(working_dir)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Command timed out after {}s", timeout_secs))?
-        .map_err(|e| anyhow::anyhow!("Failed to execute command: {}", e))?;
+        // 检测是否为交互式命令（需要 TTY 的命令，如 lark-cli config init）
+        // 这类命令使用 TUI 界面，必须继承终端的 stdin/stdout/stderr，不能 pipe
+        if is_interactive_command(command) {
+            return run_interactive_command(command, working_dir, timeout_secs).await;
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
+        // 使用流式读取：spawn 子进程，逐行读取 stdout/stderr
+        // 实时打印每行输出给用户，同时检测 URL 并提供一键打开浏览器
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::process::Command as TokioCommand;
+
+        let mut child = TokioCommand::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(working_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn command: {}", e))?;
+
+        let stdout_pipe = child.stdout.take().unwrap();
+        let stderr_pipe = child.stderr.take().unwrap();
+
+        let mut stdout_lines = BufReader::new(stdout_pipe).lines();
+        let mut stderr_lines = BufReader::new(stderr_pipe).lines();
+
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        let mut url_shown = false; // 避免重复弹出 URL 对话框
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
+        loop {
+            tokio::select! {
+                line = stdout_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            stdout_buf.push_str(&l);
+                            stdout_buf.push('\n');
+                            // 实时打印输出给用户（去掉 ANSI 控制序列后显示）
+                            let display = strip_ansi(&l);
+                            if !display.trim().is_empty() {
+                                println!("{}", display);
+                            }
+                            // 只对授权 URL 弹窗（OAuth/飞书登录等），普通链接不打断输出
+                            if !url_shown {
+                                if let Some(url) = extract_url_from_line(&l) {
+                                    if is_auth_url(&url) {
+                                        url_shown = true;
+                                        // 必须用 spawn_blocking，因为 crossterm::event::read() 是阻塞调用
+                                        // 直接在 tokio 异步任务中调用会阻塞工作线程，导致键盘事件无响应
+                                        let url_clone = url.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            show_url_and_open(&url_clone, true);
+                                        }).await.ok();
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => break, // stdout 关闭
+                        Err(_) => break,
+                    }
+                }
+                line = stderr_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            stderr_buf.push_str(&l);
+                            stderr_buf.push('\n');
+                            // 实时打印 stderr（用暗色区分）
+                            let display = strip_ansi(&l);
+                            if !display.trim().is_empty() {
+                                eprintln!("\x1b[2m{}\x1b[0m", display);
+                            }
+                            // stderr 也只对授权 URL 弹窗，普通链接不打断输出
+                            if !url_shown {
+                                if let Some(url) = extract_url_from_line(&l) {
+                                    if is_auth_url(&url) {
+                                        url_shown = true;
+                                        let url_clone = url.clone();
+                                        tokio::task::spawn_blocking(move || {
+                                            show_url_and_open(&url_clone, true);
+                                        }).await.ok();
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    // 超时：杀掉子进程
+                    let _ = child.kill().await;
+                    let stdout = stdout_buf.trim_end().to_string();
+                    let stderr = stderr_buf.trim_end().to_string();
+                    let content = if stderr.is_empty() { stdout.clone() }
+                        else if stdout.is_empty() { format!("[stderr]\n{}", stderr) }
+                        else { format!("{}\n[stderr]\n{}", stdout, stderr) };
+                    return Ok(ToolResult {
+                        success: false,
+                        data: json!({
+                            "content": content,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": -1,
+                            "command": command,
+                        }),
+                        error: Some(format!("Command timed out after {}s", timeout_secs)),
+                    });
+                }
+            }
+        }
+
+        // 等待进程退出
+        let status = child.wait().await.map_err(|e| anyhow::anyhow!("wait failed: {}", e))?;
+        let exit_code = status.code().unwrap_or(-1);
+
+        let stdout = stdout_buf.trim_end().to_string();
+        let stderr = stderr_buf.trim_end().to_string();
 
         // 合并 stdout + stderr 为 content 字段，方便 agent 读取
         let content = if stderr.is_empty() {
@@ -400,7 +789,7 @@ impl ToolExecutor for ShellTool {
         };
 
         Ok(ToolResult {
-            success: output.status.success(),
+            success: status.success(),
             data: json!({
                 "content": content,
                 "stdout": stdout,
@@ -408,7 +797,7 @@ impl ToolExecutor for ShellTool {
                 "exit_code": exit_code,
                 "command": command,
             }),
-            error: if output.status.success() { None } else {
+            error: if status.success() { None } else {
                 Some(format!("Command exited with code {}: {}", exit_code, stderr.trim()))
             },
         })

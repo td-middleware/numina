@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XVM项目FSI告警分析报告</title>
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e4e4e7;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            text-align: center;
+            padding: 40px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            font-size: 32px;
+            font-weight: 600;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            color: #9ca3af;
+            font-size: 14px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 40px rgba(0,212,255,0.1);
+        }
+        
+        .stat-value {
+            font-size: 36px;
+            font-weight: 700;
+            color: #00d4ff;
+            margin-bottom: 8px;
+        }
+        
+        .stat-label {
+            color: #9ca3af;
+            font-size: 14px;
+        }
+        
+        .chart-section {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 20px;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .chart-container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        
+        @media (max-width: 900px) {
+            .chart-container {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        .chart-box {
+            height: 350px;
+        }
+        
+        .alert-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        
+        .alert-table th {
+            background: rgba(0,212,255,0.1);
+            color: #00d4ff;
+            padding: 14px 12px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 13px;
+            border-bottom: 2px solid rgba(0,212,255,0.3);
+        }
+        
+        .alert-table td {
+            padding: 12px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 13px;
+            color: #d1d5db;
+        }
+        
+        .alert-table tr:hover {
+            background: rgba(255,255,255,0.03);
+        }
+        
+        .alert-table .vin {
+            font-family: 'Consolas', monospace;
+            color: #a5b4fc;
+        }
+        
+        .alert-table .version {
+            font-family: 'Consolas', monospace;
+            color: #34d399;
+        }
+        
+        .alert-table .log-link a {
+            color: #00d4ff;
+            text-decoration: none;
+        }
+        
+        .alert-table .log-link a:hover {
+            text-decoration: underline;
+        }
+        
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .pagination button {
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: #fff;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .pagination button:hover {
+            background: rgba(0,212,255,0.2);
+            border-color: #00d4ff;
+        }
+        
+        .pagination button.active {
+            background: #00d4ff;
+            color: #1a1a2e;
+            border-color: #00d4ff;
+        }
+        
+        .info-badge {
+            display: inline-block;
+            background: rgba(124, 58, 237, 0.2);
+            color: #a78bfa;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-right: 8px;
+        }
+        
+        .version-badge {
+            display: inline-block;
+            background: rgba(52, 211, 153, 0.15);
+            color: #34d399;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: 'Consolas', monospace;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 30px 0;
+            color: #6b7280;
+            font-size: 13px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔔 XVM项目FSI告警分析报告</h1>
+            <p class="subtitle">查询时间范围: 2026-01-20 ~ 2026-01-23 | 项目: CCU + CCU-Ultra</p>
+        </header>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-value">9,917</div>
+                <div class="stat-label">告警总数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">372</div>
+                <div class="stat-label">告警车辆数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">1,478,682</div>
+                <div class="stat-label">车辆总数</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">0.025%</div>
+                <div class="stat-label">告警车辆占比</div>
+            </div>
+        </div>
+        
+        <div class="chart-section">
+            <div class="chart-title">📊 告警趋势分析</div>
+            <div class="chart-container">
+                <div class="chart-box" id="timeSeriesChart"></div>
+                <div class="chart-box" id="versionPieChart"></div>
+            </div>
+        </div>
+        
+        <div class="chart-section">
+            <div class="chart-title">🚗 告警明细列表 (前50条)</div>
+            <table class="alert-table">
+                <thead>
+                    <tr>
+                        <th>序号</th>
+                        <th>VIN</th>
+                        <th>车系</th>
+                        <th>版本</th>
+                        <th>告警名称</th>
+                        <th>上报时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="alertTableBody">
+                </tbody>
+            </table>
+        </div>
+        
+        <footer>
+            <p>Generated by SearchBI Alert Analysis System | 数据来源: 控制器告警中心</p>
+        </footer>
+    </div>
+    
+    <script>
+        // 时间序列图表
+        const timeSeriesChart = echarts.init(document.getElementById('timeSeriesChart'));
+        const timeSeriesOption = {
+            backgroundColor: 'transparent',
+            tooltip: {
+                trigger: 'axis',
+                backgroundColor: 'rgba(17,24,39,0.95)',
+                borderColor: '#00d4ff',
+                textStyle: { color: '#fff' }
+            },
+            legend: {
+                data: ['告警数', '告警车辆数', '日活(万)'],
+                textStyle: { color: '#9ca3af' },
+                top: 10
+            },
+            grid: {
+                left: '3%',
+                right: '4%',
+                bottom: '3%',
+                containLabel: true
+            },
+            xAxis: {
+                type: 'category',
+                data: ['2026-01-20', '2026-01-21', '2026-01-22', '2026-01-23'],
+                axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+                axisLabel: { color: '#9ca3af' }
+            },
+            yAxis: [
+                {
+                    type: 'value',
+                    name: '告警数',
+                    axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+                    axisLabel: { color: '#9ca3af' },
+                    splitLine: { lineStyle: { color: 'rgba(255,255,255,0.05)' } }
+                },
+                {
+                    type: 'value',
+                    name: '告警车辆数',
+                    axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+                    axisLabel: { color: '#9ca3af' },
+                    splitLine: { show: false }
+                },
+                {
+                    type: 'value',
+                    name: '日活(万)',
+                    axisLine: { lineStyle: { color: 'rgba(255,255,255,0.1)' } },
+                    axisLabel: { color: '#9ca3af' },
+                    splitLine: { show: false }
+                }
+            ],
+            series: [
+                {
+                    name: '告警数',
+                    type: 'bar',
+                    data: [2256, 2840, 2529, 2292],
+                    itemStyle: { color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [{offset: 0, color: '#00d4ff'}, {offset: 1, color: '#0891b2'}]) }
+                },
+                {
+                    name: '告警车辆数',
+                    type: 'line',
+                    yAxisIndex: 1,
+                    data: [296, 290, 285, 285],
+                    itemStyle: { color: '#34d399' },
+                    lineStyle: { width: 3 }
+                },
+                {
+                    name: '日活(万)',
+                    type: 'line',
+                    yAxisIndex: 2,
+                    data: [82.57, 83.24, 84.051, 86.154],
+                    itemStyle: { color: '#a78bfa' },
+                    lineStyle: { width: 2, type: 'dashed' }
+                }
+            ]
+        };
+        timeSeriesChart.setOption(timeSeriesOption);
+        
+        // 版本分布饼图
+        const versionPieChart = echarts.init(document.getElementById('versionPieChart'));
+        const versionPieOption = {
+            backgroundColor: 'transparent',
+            tooltip: {
+                trigger: 'item',
+                backgroundColor: 'rgba(17,24,39,0.95)',
+                borderColor: '#00d4ff',
+                textStyle: { color: '#fff' },
+                formatter: '{b}: {c} ({d}%)'
+            },
+            legend: {
+                orient: 'vertical',
+                right: 10,
+                top: 'center',
+                textStyle: { color: '#9ca3af' }
+            },
+            series: [{
+                name: '版本分布',
+                type: 'pie',
+                radius: ['40%', '70%'],
+                center: ['40%', '50%'],
+                avoidLabelOverlap: false,
+                itemStyle: {
+                    borderRadius: 10,
+                    borderColor: '#1a1a2e',
+                    borderWidth: 2
+                },
+                label: {
+                    show: false,
+                    position: 'center'
+                },
+                emphasis: {
+                    label: {
+                        show: true,
+                        fontSize: 18,
+                        fontWeight: 'bold',
+                        color: '#fff'
+                    }
+                },
+                labelLine: { show: false },
+                data: [
+                    { value: 1896, name: '102F', itemStyle: { color: '#00d4ff' } },
+                    { value: 1189, name: '1045', itemStyle: { color: '#7c3aed' } },
+                    { value: 727, name: '1047', itemStyle: { color: '#34d399' } },
+                    { value: 579, name: '1050', itemStyle: { color: '#f59e0b' } },
+                    { value: 579, name: 'BB01', itemStyle: { color: '#ef4444' } },
+                    { value: 573, name: '1043', itemStyle: { color: '#ec4899' } },
+                    { value: 533, name: 'F2E7', itemStyle: { color: '#8b5cf6' } },
+                    { value: 436, name: '1039', itemStyle: { color: '#06b6d4' } },
+                    { value: 411, name: '1053', itemStyle: { color: '#84cc16' } },
+                    { value: 264, name: '1042', itemStyle: { color: '#f97316' } }
+                ]
+            }]
+        };
+        versionPieChart.setOption(versionPieOption);
+        
+        // 告警明细数据
+        const alertData = [
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:59:46"},
+            {"vin": "HLX12B17XR1997029", "car_series": "W04B", "version": "1043", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:59:09"},
+            {"vin": "HLX13B17XT1996077", "car_series": "W05", "version": "1054", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:58:27"},
+            {"vin": "HLX32B140S1068164", "car_series": "X04C", "version": "1052", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:57:59"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:57:36"},
+            {"vin": "HLX34B168T1300197", "car_series": "X11", "version": "1045", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:57:25"},
+            {"vin": "HLX34B16XS1464582", "car_series": "X11", "version": "1054", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:57:00"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:56:31"},
+            {"vin": "HLX34B168S1466184", "car_series": "X11", "version": "1039", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:56:27"},
+            {"vin": "HLX14B175S1996371", "car_series": "W10A", "version": "1032", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:54:33"},
+            {"vin": "HLX33B161R1997191", "car_series": "X11", "version": "BB01", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:50:39"},
+            {"vin": "HLX14B172S1996375", "car_series": "W10A", "version": "1039", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:47:31"},
+            {"vin": "HLX34B168S1466184", "car_series": "X11", "version": "1039", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:45:54"},
+            {"vin": "HLX33B16XR1997383", "car_series": "X11", "version": "1022", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:44:34"},
+            {"vin": "HLX33B165R1997159", "car_series": "X11", "version": "F281", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:43:13"},
+            {"vin": "HLX32B143P1300070", "car_series": "X04C", "version": "BB01", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:42:29"},
+            {"vin": "HLX13B17XS1996336", "car_series": "W05", "version": "1033", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:40:09"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:38:09"},
+            {"vin": "HLX13B175S1996387", "car_series": "W05", "version": "1050", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:37:23"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:37:04"},
+            {"vin": "HLX32B140S1068164", "car_series": "X04C", "version": "1052", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:36:57"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:35:58"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:34:53"},
+            {"vin": "HLX13B171S1996418", "car_series": "W05", "version": "102C", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:34:03"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:33:48"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:32:43"},
+            {"vin": "HLX32B140S1068164", "car_series": "X04C", "version": "1052", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:32:17"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:31:38"},
+            {"vin": "HLX12B17XR1997029", "car_series": "W04B", "version": "1043", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:31:32"},
+            {"vin": "HLX33B165R1997159", "car_series": "X11", "version": "F281", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:30:38"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:30:33"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:28:21"},
+            {"vin": "HLX12B17XR1997029", "car_series": "W04B", "version": "1043", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:28:18"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:27:16"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:26:11"},
+            {"vin": "HLX32B143P1300070", "car_series": "X04C", "version": "BB01", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:26:07"},
+            {"vin": "HLX33B166R1997137", "car_series": "X11", "version": "1036", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:25:27"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:25:06"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:24:01"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:22:56"},
+            {"vin": "HLX33B163R1997189", "car_series": "X11", "version": "1045", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:22:45"},
+            {"vin": "HLX33B162R1997510", "car_series": "X11", "version": "1045", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:22:26"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:21:51"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:20:45"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:19:40"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:18:35"},
+            {"vin": "HLX12B17XR1997029", "car_series": "W04B", "version": "1043", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:18:01"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:16:25"},
+            {"vin": "HLX33B162R1997510", "car_series": "X11", "version": "1045", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:16:08"},
+            {"vin": "HLX33B167R1997387", "car_series": "X11", "version": "102F", "alert_name": "M100侧诊断的故障码", "report_time": "2026-01-23 23:15:20"}
+        ];
+        
+        // 渲染表格
+        const tableBody = document.getElementById('alertTableBody');
+        alertData.forEach((item, index) => {
+            const row = document.createElement('tr');
+            row.innerHTML = `
+                <td>${index + 1}</td>
+                <td class="vin">${item.vin}</td>
+                <td><span class="info-badge">${item.car_series}</span></td>
+                <td><span class="version-badge">${item.version}</span></td>
+                <td>${item.alert_name}</td>
+                <td>${item.report_time}</td>
+                <td class="log-link"><a href="#" onclick="alert('日志链接: ${item.vin}')">查看日志</a></td>
+            `;
+            tableBody.appendChild(row);
+        });
+        
+        // 响应式调整
+        window.addEventListener('resize', () => {
+            timeSeriesChart.resize();
+            versionPieChart.resize();
+        });
+    </script>
+</body>
+</html>

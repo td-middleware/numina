@@ -490,6 +490,29 @@ impl SkillManager {
         matches
     }
 
+    /// 检测用户输入中是否直接引用了 skill 名称（如 "基于/lark-im这个skill" 或 "用lark-im"）
+    /// 支持格式：
+    ///   - `/skill-name`（斜杠引用，即使不在句首）
+    ///   - `skill-name` 直接出现在输入中（精确匹配 skill 名）
+    /// 返回命中的 skill 列表
+    pub fn extract_referenced_skills<'a>(&'a self, user_input: &str) -> Vec<&'a Skill> {
+        let mut result = Vec::new();
+        for skill in &self.skills {
+            // 检测 /skill-name 形式（斜杠引用，不要求在句首）
+            let slash_ref = format!("/{}", skill.name);
+            if user_input.contains(&slash_ref) {
+                result.push(skill);
+                continue;
+            }
+            // 检测直接名称引用（skill 名本身出现在输入中，要求完整词匹配）
+            // 只对含连字符的 skill 名做此检测（避免误匹配短词）
+            if skill.name.contains('-') && user_input.contains(&skill.name) {
+                result.push(skill);
+            }
+        }
+        result
+    }
+
     /// 【方案一】为命中的 skill 生成完整内容块（按需展开，注入到本次请求）
     pub fn expand_matched_skills(&self, user_input: &str) -> String {
         let matched = self.match_intent(user_input);
@@ -906,5 +929,138 @@ $ARGUMENT
         assert!(expanded.contains("Activated Skills"));
         assert!(expanded.contains("search_alert")); // 完整内容
         assert!(expanded.contains("alert-search"));
+    }
+
+    // ─────────────────────────────────────────────
+    // extract_referenced_skills 测试
+    // ─────────────────────────────────────────────
+
+    fn make_lark_im_skill() -> Skill {
+        Skill {
+            name: "lark-im".to_string(),
+            description: "飞书即时通讯：收发消息和管理群聊".to_string(),
+            when_to_use: None, // 无 when_to_use，不走意图路由
+            argument_hint: Some("<message>".to_string()),
+            content: "# lark-im\n使用 lark-cli im send 发送消息\n$ARGUMENT".to_string(),
+            base_dir: None,
+            loaded_from: SkillSource::Global,
+            examples: vec![],
+        }
+    }
+
+    fn make_lark_calendar_skill() -> Skill {
+        Skill {
+            name: "lark-calendar".to_string(),
+            description: "飞书日历：查看和管理日程".to_string(),
+            when_to_use: None,
+            argument_hint: None,
+            content: "# lark-calendar\n使用 lark-cli calendar 管理日程\n$ARGUMENT".to_string(),
+            base_dir: None,
+            loaded_from: SkillSource::Global,
+            examples: vec![],
+        }
+    }
+
+    /// 测试：句中 /skill-name 引用（最常见场景）
+    /// 用户输入："基于/lark-im这个skill，给我发消息"
+    #[test]
+    fn test_extract_referenced_skills_slash_in_sentence() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill(), make_lark_calendar_skill()]);
+        let result = mgr.extract_referenced_skills("基于/lark-im这个skill，给我发消息");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "lark-im");
+    }
+
+    /// 测试：句首 /skill-name（但不以 / 开头的普通输入，extract_referenced_skills 也能识别）
+    #[test]
+    fn test_extract_referenced_skills_slash_at_start_of_word() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill()]);
+        let result = mgr.extract_referenced_skills("请用/lark-im发一条消息");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "lark-im");
+    }
+
+    /// 测试：直接名称引用（含连字符的 skill 名出现在输入中）
+    #[test]
+    fn test_extract_referenced_skills_direct_name() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill()]);
+        let result = mgr.extract_referenced_skills("用lark-im给我发消息");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "lark-im");
+    }
+
+    /// 测试：多个 skill 引用，只返回命中的
+    #[test]
+    fn test_extract_referenced_skills_multiple() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill(), make_lark_calendar_skill()]);
+        let result = mgr.extract_referenced_skills("用/lark-im发消息，同时查/lark-calendar日程");
+        assert_eq!(result.len(), 2);
+        let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"lark-im"));
+        assert!(names.contains(&"lark-calendar"));
+    }
+
+    /// 测试：无引用时返回空
+    #[test]
+    fn test_extract_referenced_skills_no_match() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill()]);
+        let result = mgr.extract_referenced_skills("帮我查一下今天的天气");
+        assert!(result.is_empty());
+    }
+
+    /// 测试：无 when_to_use 的 skill 不走意图路由（expand_matched_skills 不命中）
+    #[test]
+    fn test_no_when_to_use_skill_not_in_intent_route() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill()]);
+        // lark-im 没有 when_to_use，即使输入包含 "发消息" 也不应被意图路由命中
+        let expanded = mgr.expand_matched_skills("给我发一条飞书消息");
+        assert!(expanded.is_empty(), "无 when_to_use 的 skill 不应被意图路由命中");
+    }
+
+    /// 测试：有 when_to_use 的 skill 走意图路由，无需明确指定
+    #[test]
+    fn test_with_when_to_use_skill_in_intent_route() {
+        let mgr = SkillManager::new(vec![make_alert_skill()]);
+        let expanded = mgr.expand_matched_skills("查一下告警数据");
+        assert!(!expanded.is_empty(), "有 when_to_use 的 skill 应被意图路由命中");
+        assert!(expanded.contains("alert-search"));
+    }
+
+    /// 测试：extract_referenced_skills 不受 when_to_use 影响
+    /// 即使 skill 没有 when_to_use，只要用户明确引用了 /skill-name，就应该命中
+    #[test]
+    fn test_explicit_reference_works_without_when_to_use() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill()]);
+        // lark-im 没有 when_to_use，但用户明确引用了 /lark-im
+        let result = mgr.extract_referenced_skills("基于/lark-im，以用户身份给我发小飞书消息，发送\"你好，下午了\"");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].name, "lark-im");
+    }
+
+    /// 测试：skill.expand_prompt 正确替换 $ARGUMENT
+    /// 模拟 extract_inline_skill_reference 的 prompt 构建逻辑
+    #[test]
+    fn test_skill_expand_prompt_with_user_intent() {
+        let skill = make_lark_im_skill();
+        // 用户意图（去掉 /lark-im 引用后的部分）
+        let user_intent = "以用户身份给我发小飞书消息，发送\"你好，下午了\"";
+        let prompt = skill.expand_prompt(user_intent);
+        // prompt 应包含 skill 内容 + 用户意图替换了 $ARGUMENT
+        assert!(prompt.contains("lark-cli im send"));
+        assert!(prompt.contains("你好，下午了"));
+    }
+
+    /// 测试：summary_prompt_block 只包含有 when_to_use 的 skill
+    /// 无 when_to_use 的 skill（如 lark-im）只出现在 Manual Skills 区域
+    #[test]
+    fn test_summary_prompt_block_separates_auto_and_manual() {
+        let mgr = SkillManager::new(vec![make_lark_im_skill(), make_alert_skill()]);
+        let block = mgr.summary_prompt_block();
+        // alert-search 有 when_to_use → 出现在 Intent-Triggered 区域
+        assert!(block.contains("Intent-Triggered"));
+        assert!(block.contains("alert-search"));
+        // lark-im 无 when_to_use → 出现在 Manual Skills 区域
+        assert!(block.contains("Manual Skills"));
+        assert!(block.contains("lark-im"));
     }
 }

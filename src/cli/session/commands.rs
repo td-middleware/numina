@@ -712,3 +712,1000 @@ pub fn cmd_show(session_id: &str) -> Result<()> {
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────
+// /auth — 交互式授权管理菜单
+// ─────────────────────────────────────────────
+
+/// /auth 交互式菜单：渠道选择 → 操作选择
+/// 第一层：选择渠道（Lark / 未来可扩展）
+/// 第二层：选择操作（登录 / 查看状态 / 退出登录）
+pub async fn cmd_auth_browser() -> Result<()> {
+    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+    use crossterm::event::KeyCode;
+    use tokio::process::Command;
+
+    // ── 渠道列表 ──
+    let channels: &[(&str, &str)] = &[
+        ("Lark / 飞书", "通过 lark-cli 管理飞书用户授权"),
+    ];
+
+    // ── 操作列表（Lark） ──
+    let lark_actions: &[(&str, &str)] = &[
+        ("login",         "飞书用户登录授权（lark-cli auth login）"),
+        ("login --scope", "按 scope 授权（输入 scope 后执行）"),
+        ("login --domain","按业务域授权（输入 domain 后执行）"),
+        ("status",        "查看当前授权状态"),
+        ("logout",        "退出飞书登录"),
+    ];
+
+    // ── 预留渲染空间 ──
+    let tui_reserve = 12usize;
+    for _ in 0..tui_reserve { println!(); }
+    print!("\x1b[{}A\x1b[0J", tui_reserve);
+    std::io::stdout().flush()?;
+
+    // ── 渲染渠道列表 ──
+    let mut ch_sel = 0usize;
+    let mut ch_lines = render_auth_channels(channels, ch_sel);
+    std::io::stdout().flush()?;
+
+    enable_raw_mode()?;
+
+    'ch_loop: loop {
+        match wait_key() {
+            Some(KeyCode::Esc) | Some(KeyCode::Char('q')) => break 'ch_loop,
+            Some(KeyCode::Up) => {
+                ch_sel = if ch_sel > 0 { ch_sel - 1 } else { channels.len().saturating_sub(1) };
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", ch_lines);
+                ch_lines = render_auth_channels(channels, ch_sel);
+                std::io::stdout().flush()?;
+                enable_raw_mode()?;
+            }
+            Some(KeyCode::Down) => {
+                ch_sel = (ch_sel + 1) % channels.len();
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", ch_lines);
+                ch_lines = render_auth_channels(channels, ch_sel);
+                std::io::stdout().flush()?;
+                enable_raw_mode()?;
+            }
+            Some(KeyCode::Enter) => {
+                // 进入操作层
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", ch_lines);
+
+                let mut act_sel = 0usize;
+                let ch_name = channels[ch_sel].0;
+                let mut act_lines = render_auth_actions(ch_name, lark_actions, act_sel);
+                std::io::stdout().flush()?;
+                enable_raw_mode()?;
+
+                'act_loop: loop {
+                    match wait_key() {
+                        Some(KeyCode::Esc) => {
+                            disable_raw_mode()?;
+                            print!("\x1b[{}A\x1b[0J", act_lines);
+                            ch_lines = render_auth_channels(channels, ch_sel);
+                            std::io::stdout().flush()?;
+                            enable_raw_mode()?;
+                            break 'act_loop;
+                        }
+                        Some(KeyCode::Up) => {
+                            act_sel = if act_sel > 0 { act_sel - 1 } else { lark_actions.len().saturating_sub(1) };
+                            disable_raw_mode()?;
+                            print!("\x1b[{}A\x1b[0J", act_lines);
+                            act_lines = render_auth_actions(ch_name, lark_actions, act_sel);
+                            std::io::stdout().flush()?;
+                            enable_raw_mode()?;
+                        }
+                        Some(KeyCode::Down) => {
+                            act_sel = (act_sel + 1) % lark_actions.len();
+                            disable_raw_mode()?;
+                            print!("\x1b[{}A\x1b[0J", act_lines);
+                            act_lines = render_auth_actions(ch_name, lark_actions, act_sel);
+                            std::io::stdout().flush()?;
+                            enable_raw_mode()?;
+                        }
+                        Some(KeyCode::Enter) => {
+                            let action = lark_actions[act_sel].0;
+                            disable_raw_mode()?;
+                            print!("\x1b[{}A\x1b[0J", act_lines);
+                            std::io::stdout().flush()?;
+
+                            // 执行选中的操作
+                            match action {
+                                "login" => {
+                                    cmd_lark_login("").await?;
+                                }
+                                "login --scope" => {
+                                    // 提示用户输入 scope
+                                    print!("  {}输入 scope（如 im:message calendar:calendar:readonly）：{} ", GRAY, RESET);
+                                    std::io::stdout().flush()?;
+                                    let mut scope = String::new();
+                                    std::io::stdin().read_line(&mut scope)?;
+                                    let scope = scope.trim().to_string();
+                                    if !scope.is_empty() {
+                                        cmd_lark_login(&format!("--scope {}", scope)).await?;
+                                    } else {
+                                        println!("  {}已取消{}", GRAY, RESET);
+                                    }
+                                }
+                                "login --domain" => {
+                                    // 提示用户输入 domain
+                                    print!("  {}输入 domain（如 calendar、im、drive）：{} ", GRAY, RESET);
+                                    std::io::stdout().flush()?;
+                                    let mut domain = String::new();
+                                    std::io::stdin().read_line(&mut domain)?;
+                                    let domain = domain.trim().to_string();
+                                    if !domain.is_empty() {
+                                        cmd_lark_login(&format!("--domain {}", domain)).await?;
+                                    } else {
+                                        println!("  {}已取消{}", GRAY, RESET);
+                                    }
+                                }
+                                "status" => {
+                                    cmd_lark_auth_status().await?;
+                                }
+                                "logout" => {
+                                    cmd_lark_auth_logout().await?;
+                                }
+                                _ => {}
+                            }
+
+                            // 操作完成后退出菜单
+                            break 'ch_loop;
+                        }
+                        None => break 'act_loop,
+                        _ => {}
+                    }
+                }
+            }
+            None => break 'ch_loop,
+            _ => {}
+        }
+    }
+
+    disable_raw_mode()?;
+    println!();
+    Ok(())
+}
+
+/// 渲染渠道选择列表，返回行数
+fn render_auth_channels(channels: &[(&str, &str)], sel: usize) -> usize {
+    let sep = "─".repeat(50);
+    println!("  {}{}Auth 授权管理{}  {}↑↓ 选择  Enter 进入  Esc 退出{}", BOLD, BRIGHT_WHITE, RESET, GRAY, RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
+    let mut lines = 2usize;
+    for (i, (name, desc)) in channels.iter().enumerate() {
+        if i == sel {
+            println!("  {}{} ▶ {}{:<20}{}  {}{}{}", BOLD, CYAN, BRIGHT_WHITE, name, RESET, DIM, desc, RESET);
+        } else {
+            println!("     {}{:<20}{}  {}{}{}", GRAY, name, RESET, DIM, desc, RESET);
+        }
+        lines += 1;
+    }
+    println!("  {}{}{}", GRAY, sep, RESET);
+    lines += 1;
+    lines
+}
+
+/// 渲染操作选择列表，返回行数
+fn render_auth_actions(ch_name: &str, actions: &[(&str, &str)], sel: usize) -> usize {
+    let sep = "─".repeat(50);
+    println!("  {}{}{}{}  {}›{}  {}操作列表{}  {}↑↓ 选择  Enter 执行  Esc 返回{}",
+        BOLD, BRIGHT_WHITE, ch_name, RESET, GRAY, RESET, BOLD, RESET, GRAY, RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
+    let mut lines = 2usize;
+    for (i, (action, desc)) in actions.iter().enumerate() {
+        if i == sel {
+            println!("  {}{} ▶ {}{:<22}{}  {}{}{}", BOLD, CYAN, BRIGHT_WHITE, action, RESET, DIM, desc, RESET);
+        } else {
+            println!("     {}{:<22}{}  {}{}{}", GRAY, action, RESET, DIM, desc, RESET);
+        }
+        lines += 1;
+    }
+    println!("  {}{}{}", GRAY, sep, RESET);
+    lines += 1;
+    lines
+}
+
+/// 查看飞书授权状态（TUI 内）
+async fn cmd_lark_auth_status() -> Result<()> {
+    use tokio::process::Command;
+    println!();
+    println!("  {}🔍 查询飞书授权状态...{}", GRAY, RESET);
+
+    let output = Command::new("lark-cli")
+        .args(["contact", "user", "me", "--as", "user"])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                let name = json.pointer("/data/name").and_then(|v| v.as_str()).unwrap_or("未知");
+                let email = json.pointer("/data/email").and_then(|v| v.as_str()).unwrap_or("");
+                println!("  {}✅ 已登录：{}{}{}", GRAY, BOLD, name, RESET);
+                if !email.is_empty() {
+                    println!("  {}   邮箱：{}{}", GRAY, email, RESET);
+                }
+            } else {
+                println!("  {}✅ 飞书授权有效{}", GREEN, RESET);
+            }
+        }
+        _ => {
+            println!("  {}❌ 未登录或授权已过期，请运行 /auth 重新授权{}", YELLOW, RESET);
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// 退出飞书登录（TUI 内）
+async fn cmd_lark_auth_logout() -> Result<()> {
+    use tokio::process::Command;
+    println!();
+    println!("  {}🚪 正在退出飞书登录...{}", GRAY, RESET);
+
+    let status = Command::new("lark-cli")
+        .args(["auth", "logout"])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await;
+
+    match status {
+        Ok(s) if s.success() => {
+            // 清除本地缓存
+            if let Some(path) = dirs::home_dir().map(|h| h.join(".numina").join("cache").join("lark_user.json")) {
+                let _ = std::fs::remove_file(path);
+            }
+            println!("  {}✅ 已退出飞书登录{}", GREEN, RESET);
+        }
+        _ => {
+            println!("  {}⚠️  退出登录时遇到问题，请手动清理 lark-cli 凭证{}", YELLOW, RESET);
+        }
+    }
+    println!();
+    Ok(())
+}
+
+// ─────────────────────────────────────────────
+// /login — 飞书 OAuth 用户登录（浏览器扫码/账号登录）
+// ─────────────────────────────────────────────
+
+/// 读取飞书 app_id：优先环境变量 LARK_APP_ID，其次 ~/.numina/cache/lark_app.json
+fn load_lark_app_id() -> Option<String> {
+    // 1. 环境变量
+    if let Ok(id) = std::env::var("LARK_APP_ID") {
+        if !id.is_empty() { return Some(id); }
+    }
+    // 2. ~/.numina/cache/lark_app.json: { "app_id": "...", "app_secret": "..." }
+    let path = dirs::home_dir()?.join(".numina").join("cache").join("lark_app.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("app_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// 读取飞书 app_secret
+fn load_lark_app_secret() -> Option<String> {
+    if let Ok(s) = std::env::var("LARK_APP_SECRET") {
+        if !s.is_empty() { return Some(s); }
+    }
+    let path = dirs::home_dir()?.join(".numina").join("cache").join("lark_app.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("app_secret").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// 飞书 OAuth 用户登录：
+/// 1. 打开浏览器到飞书授权页（扫码或账号登录）
+/// 2. 本地 HTTP server 接收 OAuth callback（code）
+/// 3. 用 code 换取 user_access_token
+/// 4. 获取用户信息并缓存
+pub async fn cmd_lark_login(_args_str: &str) -> Result<()> {
+    const CALLBACK_PORT: u16 = 9527;
+    const REDIRECT_URI: &str = "http://localhost:9527/callback";
+
+    // ── 读取 app_id（未配置则引导用户输入）──
+    let (app_id, app_secret_configured) = match (load_lark_app_id(), load_lark_app_secret()) {
+        (Some(id), Some(secret)) => (id, secret),
+        _ => {
+            // 引导用户配置
+            println!();
+            println!("  {}⚙️  首次使用飞书登录，需要配置飞书应用凭证{}", BOLD, RESET);
+            println!("  {}{}{}", GRAY, "─".repeat(52), RESET);
+            println!("  {}请前往飞书开放平台创建应用并获取凭证：{}", DIM, RESET);
+            println!("  {}  https://open.feishu.cn/app{}", CYAN, RESET);
+            println!("  {}创建「自建应用」后，在「凭证与基础信息」中获取{}", DIM, RESET);
+            println!("  {}App ID（cli_xxx）和 App Secret{}", DIM, RESET);
+            println!("  {}并在「安全设置」中添加重定向 URL：{}", DIM, RESET);
+            println!("  {}  http://localhost:9527/callback{}", CYAN, RESET);
+            println!("  {}{}{}", GRAY, "─".repeat(52), RESET);
+            println!();
+
+            // 输入 App ID
+            print!("  {}App ID（cli_xxx）：{} ", GRAY, RESET);
+            std::io::stdout().flush()?;
+            let mut input_id = String::new();
+            std::io::stdin().read_line(&mut input_id)?;
+            let input_id = input_id.trim().to_string();
+            if input_id.is_empty() {
+                println!("  {}已取消{}", GRAY, RESET);
+                println!();
+                return Ok(());
+            }
+
+            // 输入 App Secret
+            print!("  {}App Secret：{} ", GRAY, RESET);
+            std::io::stdout().flush()?;
+            let mut input_secret = String::new();
+            std::io::stdin().read_line(&mut input_secret)?;
+            let input_secret = input_secret.trim().to_string();
+            if input_secret.is_empty() {
+                println!("  {}已取消{}", GRAY, RESET);
+                println!();
+                return Ok(());
+            }
+
+            // 保存到 ~/.numina/cache/lark_app.json
+            if let Some(dir) = dirs::home_dir().map(|h| h.join(".numina").join("cache")) {
+                let _ = std::fs::create_dir_all(&dir);
+                let json = serde_json::json!({
+                    "app_id": input_id,
+                    "app_secret": input_secret,
+                });
+                if let Ok(text) = serde_json::to_string_pretty(&json) {
+                    let _ = std::fs::write(dir.join("lark_app.json"), text);
+                    println!("  {}✅ 已保存到 ~/.numina/cache/lark_app.json{}", GREEN, RESET);
+                }
+            }
+            println!();
+
+            (input_id, input_secret)
+        }
+    };
+    let _ = app_secret_configured; // 后续通过 load_lark_app_secret() 读取
+
+    // ── 生成 state 防 CSRF ──
+    let state = uuid::Uuid::new_v4().to_string();
+
+    // ── 构造飞书 OAuth 授权 URL ──
+    let auth_url = format!(
+        "https://open.feishu.cn/open-apis/authen/v1/authorize?app_id={}&redirect_uri={}&state={}",
+        app_id,
+        urlencoding_simple(REDIRECT_URI),
+        state,
+    );
+
+    println!();
+    println!("  {}🔐 飞书用户登录{}", BOLD, RESET);
+    println!("  {}{}{}", GRAY, "─".repeat(52), RESET);
+    println!("  {}⚠️  登录前请确认已完成以下配置：{}", YELLOW, RESET);
+    println!("  {}1. 前往飞书开放平台应用后台：{}", DIM, RESET);
+    println!("  {}   https://open.feishu.cn/app/{}{}", CYAN, app_id, RESET);
+    println!("  {}2. 进入「安全设置」→「重定向 URL」{}", DIM, RESET);
+    println!("  {}3. 添加以下 URL（完整复制，不要有空格）：{}", DIM, RESET);
+    println!("  {}   http://localhost:9527/callback{}", GREEN, RESET);
+    println!("  {}4. 保存后再点击浏览器中的授权按钮{}", DIM, RESET);
+    println!("  {}{}{}", GRAY, "─".repeat(52), RESET);
+    println!("  {}正在打开浏览器...{}", GRAY, RESET);
+    println!();
+
+    // ── 打开浏览器 ──
+    let open_result = tokio::process::Command::new("open")
+        .arg(&auth_url)
+        .status()
+        .await;
+
+    if open_result.is_err() {
+        // macOS open 失败，尝试 xdg-open（Linux）
+        let _ = tokio::process::Command::new("xdg-open")
+            .arg(&auth_url)
+            .status()
+            .await;
+    }
+
+    println!("  {}如果浏览器未自动打开，请手动访问：{}", GRAY, RESET);
+    println!("  {}{}{}", DIM, auth_url, RESET);
+    println!();
+
+    // ── 启动本地 HTTP server 等待 OAuth callback ──
+    let code = wait_for_oauth_callback(CALLBACK_PORT, &state).await?;
+
+    if code.is_empty() {
+        println!("  {}⚠️  未收到授权码，登录已取消{}", YELLOW, RESET);
+        println!();
+        return Ok(());
+    }
+
+    println!("  {}✅ 收到授权码，正在获取用户信息...{}", GRAY, RESET);
+
+    // ── 用 code 换取 user_access_token ──
+    let app_secret = load_lark_app_secret().unwrap_or_default();
+    match exchange_code_for_token(&app_id, &app_secret, &code, REDIRECT_URI).await {
+        Ok(token_info) => {
+            // 保存 token 和用户信息
+            save_lark_token_cache(&token_info);
+            if let Some(user) = token_info.user_info() {
+                save_lark_user_cache(&user);
+                // 后台下载头像（静默，失败不影响登录）
+                if !user.avatar_url.is_empty() {
+                    download_lark_avatar(&user.avatar_url).await;
+                }
+                println!("  {}✅ 登录成功！{}", GREEN, RESET);
+                println!("  {}👤 {}{}{}", GRAY, BOLD, user.name, RESET);
+                if !user.email.is_empty() {
+                    println!("  {}   {}{}", DIM, user.email, RESET);
+                }
+            } else {
+                println!("  {}✅ 登录成功！{}", GREEN, RESET);
+            }
+            println!("  {}现在可以使用飞书相关功能{}", DIM, RESET);
+        }
+        Err(e) => {
+            println!("  {}⚠️  获取用户信息失败：{}{}", YELLOW, e, RESET);
+            println!("  {}请检查 app_id / app_secret 是否正确{}", DIM, RESET);
+        }
+    }
+    println!();
+
+    Ok(())
+}
+
+/// 简单 URL 编码（只处理常见字符，避免引入额外依赖）
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// 本地 HTTP server，等待飞书 OAuth callback，返回 code
+async fn wait_for_oauth_callback(port: u16, expected_state: &str) -> Result<String> {
+    use tokio::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await
+        .map_err(|e| anyhow::anyhow!("无法监听端口 {}：{}", port, e))?;
+
+    println!("  {}⏳ 等待浏览器授权回调（端口 {}）...{}", GRAY, port, RESET);
+
+    // 超时 120 秒
+    let timeout = tokio::time::Duration::from_secs(120);
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await?;
+            let request = String::from_utf8_lossy(&buf[..n]);
+
+            // 解析 GET /callback?code=xxx&state=yyy
+            if let Some(code) = parse_oauth_code(&request, expected_state) {
+                // 返回成功页面
+                let html = "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>\
+                    <h2>✅ 授权成功！</h2><p>请返回 Numina 继续操作。</p>\
+                    <script>setTimeout(()=>window.close(),2000)</script></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(), html
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                return Ok::<String, anyhow::Error>(code);
+            } else {
+                // 非 callback 请求，返回等待页
+                let html = "<html><body style='font-family:sans-serif;text-align:center;padding:60px'>\
+                    <h2>⏳ 等待授权...</h2></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(), html
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        }
+    }).await;
+
+    match result {
+        Ok(Ok(code)) => Ok(code),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            println!("  {}⏰ 等待超时（120秒），登录已取消{}", YELLOW, RESET);
+            Ok(String::new())
+        }
+    }
+}
+
+/// 从 HTTP 请求中解析 OAuth code
+fn parse_oauth_code(request: &str, expected_state: &str) -> Option<String> {
+    // 找到请求行：GET /callback?code=xxx&state=yyy HTTP/1.1
+    let first_line = request.lines().next()?;
+    if !first_line.contains("/callback") {
+        return None;
+    }
+
+    // 提取 query string
+    let query = first_line.split('?').nth(1)?.split(' ').next()?;
+
+    let mut code = None;
+    let mut state = None;
+
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let k = kv.next()?;
+        let v = kv.next().unwrap_or("");
+        match k {
+            "code"  => code  = Some(url_decode(v)),
+            "state" => state = Some(url_decode(v)),
+            _ => {}
+        }
+    }
+
+    // 验证 state
+    if state.as_deref() != Some(expected_state) {
+        return None;
+    }
+
+    code.filter(|c| !c.is_empty())
+}
+
+/// 简单 URL 解码
+fn url_decode(s: &str) -> String {
+    let mut out = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i+1..i+3]) {
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if bytes[i] == b'+' {
+            out.push(' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// 飞书 token 信息
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct LarkTokenInfo {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+    pub name: String,
+    pub en_name: String,
+    pub avatar_url: String,
+    pub email: String,
+    pub open_id: String,
+    pub union_id: String,
+}
+
+impl LarkTokenInfo {
+    pub fn user_info(&self) -> Option<LarkUserInfo> {
+        if self.name.is_empty() && self.open_id.is_empty() {
+            return None;
+        }
+        Some(LarkUserInfo {
+            name: self.name.clone(),
+            en_name: self.en_name.clone(),
+            avatar_url: self.avatar_url.clone(),
+            email: self.email.clone(),
+            open_id: self.open_id.clone(),
+        })
+    }
+}
+
+/// 用 code 换取 user_access_token，再调用 user_info 接口获取用户信息
+async fn exchange_code_for_token(
+    app_id: &str,
+    app_secret: &str,
+    code: &str,
+    _redirect_uri: &str,
+) -> Result<LarkTokenInfo> {
+    let client = reqwest::Client::new();
+
+    // Step 1: 用 code 换取 user_access_token
+    let app_token = get_app_access_token(app_id, app_secret).await?;
+    let body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "code": code,
+    });
+
+    let resp = client
+        .post("https://open.feishu.cn/open-apis/authen/v1/oidc/access_token")
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("Authorization", format!("Bearer {}", app_token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("请求飞书 API 失败：{}", e))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("解析响应失败：{}", e))?;
+
+    let code_val = json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code_val != 0 {
+        let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown error");
+        return Err(anyhow::anyhow!("飞书 API 错误 {}: {}", code_val, msg));
+    }
+
+    let data = json.get("data").ok_or_else(|| anyhow::anyhow!("响应缺少 data 字段"))?;
+    let user_access_token = data.get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let refresh_token = data.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let expires_in = data.get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(7200);
+
+    // Step 2: 用 user_access_token 调用 authen/v1/user_info 获取用户信息
+    let user_resp = client
+        .get("https://open.feishu.cn/open-apis/authen/v1/user_info")
+        .header("Authorization", format!("Bearer {}", user_access_token))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("获取用户信息失败：{}", e))?;
+
+    let user_json: serde_json::Value = user_resp.json().await
+        .map_err(|e| anyhow::anyhow!("解析用户信息失败：{}", e))?;
+
+    let u = user_json.get("data").unwrap_or(&serde_json::Value::Null);
+
+    let token_info = LarkTokenInfo {
+        access_token:  user_access_token,
+        refresh_token,
+        token_type:    "Bearer".to_string(),
+        expires_in,
+        name:      u.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        en_name:   u.get("en_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        avatar_url: u.get("avatar_url").and_then(|v| v.as_str())
+                     .or_else(|| u.pointer("/avatar/avatar_origin").and_then(|v| v.as_str()))
+                     .unwrap_or("").to_string(),
+        email:     u.get("email").and_then(|v| v.as_str())
+                    .or_else(|| u.get("enterprise_email").and_then(|v| v.as_str()))
+                    .unwrap_or("").to_string(),
+        open_id:   u.get("open_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        union_id:  u.get("union_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    };
+
+    Ok(token_info)
+}
+
+/// 获取 app_access_token（tenant_access_token 或 app_access_token）
+async fn get_app_access_token(app_id: &str, app_secret: &str) -> Result<String> {
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "app_id": app_id,
+        "app_secret": app_secret,
+    });
+
+    let resp = client
+        .post("https://open.feishu.cn/open-apis/auth/v3/app_access_token/internal")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("获取 app_access_token 失败：{}", e))?;
+
+    let json: serde_json::Value = resp.json().await
+        .map_err(|e| anyhow::anyhow!("解析 app_access_token 响应失败：{}", e))?;
+
+    let code_val = json.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code_val != 0 {
+        let msg = json.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        return Err(anyhow::anyhow!("获取 app_access_token 失败 {}: {}", code_val, msg));
+    }
+
+    json.get("app_access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("响应中缺少 app_access_token"))
+}
+
+/// 保存 token 到 ~/.numina/cache/lark_token.json
+pub fn save_lark_token_cache(info: &LarkTokenInfo) {
+    if let Some(dir) = dirs::home_dir().map(|h| h.join(".numina").join("cache")) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(json) = serde_json::to_string_pretty(info) {
+            let _ = std::fs::write(dir.join("lark_token.json"), json);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+// 飞书用户信息缓存（~/.numina/cache/lark_user.json）
+// ─────────────────────────────────────────────
+
+/// 飞书用户信息（缓存结构）
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct LarkUserInfo {
+    pub name: String,
+    pub en_name: String,
+    pub avatar_url: String,
+    pub email: String,
+    pub open_id: String,
+}
+
+/// 通过 lark-cli 获取当前登录用户信息
+pub async fn fetch_lark_user_info() -> Option<LarkUserInfo> {
+    use tokio::process::Command;
+    let output = Command::new("lark-cli")
+        .args(["contact", "user", "me", "--as", "user"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+    // lark-cli 返回格式：{ "data": { "name": "...", "avatar": { "avatar_origin": "..." }, ... } }
+    let data = json.get("data")?;
+
+    let name = data.get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let en_name = data.get("en_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let avatar_url = data.get("avatar")
+        .and_then(|a| a.get("avatar_origin"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("avatar_url").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    let email = data.get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let open_id = data.get("open_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(LarkUserInfo { name, en_name, avatar_url, email, open_id })
+}
+
+/// 保存用户信息到 ~/.numina/cache/lark_user.json
+pub fn save_lark_user_cache(info: &LarkUserInfo) {
+    if let Some(dir) = dirs::home_dir().map(|h| h.join(".numina").join("cache")) {
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(json) = serde_json::to_string_pretty(info) {
+            let _ = std::fs::write(dir.join("lark_user.json"), json);
+        }
+    }
+}
+
+/// 读取缓存的用户信息
+pub fn load_lark_user_cache() -> Option<LarkUserInfo> {
+    let path = dirs::home_dir()?.join(".numina").join("cache").join("lark_user.json");
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 下载飞书头像到 ~/.numina/cache/lark_avatar.png
+/// 下载成功后自动生成圆形版本 lark_avatar_circle.png
+/// 如果 URL 为空或下载失败则静默忽略
+pub async fn download_lark_avatar(url: &str) {
+    if url.is_empty() { return; }
+    let cache_dir = match dirs::home_dir().map(|h| h.join(".numina").join("cache")) {
+        Some(d) => d,
+        None => return,
+    };
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let dest = cache_dir.join("lark_avatar.png");
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    if let Ok(resp) = client.get(url).send().await {
+        if let Ok(bytes) = resp.bytes().await {
+            if std::fs::write(&dest, &bytes).is_ok() {
+                // 下载成功后，生成圆形头像
+                let circle_dest = cache_dir.join("lark_avatar_circle.png");
+                crate::cli::session::renderer::make_circle_avatar(&dest, &circle_dest);
+            }
+        }
+    }
+}
+
+/// 读取本地缓存的头像路径（~/.numina/cache/lark_avatar.png）
+pub fn lark_avatar_cache_path() -> Option<std::path::PathBuf> {
+    let path = dirs::home_dir()?.join(".numina").join("cache").join("lark_avatar.png");
+    if path.exists() { Some(path) } else { None }
+}
+
+/// 读取本地缓存的圆形头像路径（~/.numina/cache/lark_avatar_circle.png）
+/// 若圆形版本不存在，尝试从原图实时生成；若原图也不存在则返回 None
+pub fn lark_avatar_circle_path() -> Option<std::path::PathBuf> {
+    let cache_dir = dirs::home_dir()?.join(".numina").join("cache");
+    let circle = cache_dir.join("lark_avatar_circle.png");
+    if circle.exists() {
+        return Some(circle);
+    }
+    // 圆形版本不存在，尝试从原图实时生成
+    let src = cache_dir.join("lark_avatar.png");
+    if src.exists() {
+        if crate::cli::session::renderer::make_circle_avatar(&src, &circle) {
+            return Some(circle);
+        }
+    }
+    None
+}
+
+// ─────────────────────────────────────────────
+// 飞书登录过期检测
+// ─────────────────────────────────────────────
+
+/// 检查飞书登录是否已过期（超过 8 小时未重新登录）
+/// 返回 Some(hours) 表示已过期多少小时，None 表示未登录或未过期
+pub fn check_lark_login_expiry() -> Option<u64> {
+    let token_path = dirs::home_dir()?.join(".numina").join("cache").join("lark_token.json");
+    if !token_path.exists() {
+        return None; // 未登录，不提示
+    }
+    let meta = std::fs::metadata(&token_path).ok()?;
+    let modified = meta.modified().ok()?;
+    let elapsed = modified.elapsed().ok()?;
+    let hours = elapsed.as_secs() / 3600;
+    if hours >= 8 {
+        Some(hours)
+    } else {
+        None
+    }
+}
+
+// ─────────────────────────────────────────────
+// /login — 统一用户登录入口（平台选择 + 确认）
+// ─────────────────────────────────────────────
+
+/// 平台定义
+struct LoginPlatform {
+    name: &'static str,
+    desc: &'static str,
+    available: bool,
+}
+
+/// 渲染平台选择列表，返回行数
+fn render_login_platforms(platforms: &[LoginPlatform], sel: usize) -> usize {
+    let sep = "─".repeat(52);
+    println!("  {}{}登录授权{}  {}↑↓ 选择平台  Enter 确认  Esc 退出{}",
+        BOLD, BRIGHT_WHITE, RESET, GRAY, RESET);
+    println!("  {}{}{}", GRAY, sep, RESET);
+    let mut lines = 2usize;
+    for (i, p) in platforms.iter().enumerate() {
+        if i == sel {
+            if p.available {
+                println!("  {}{} ▶ {}{:<20}{}  {}{}{}", BOLD, CYAN, BRIGHT_WHITE, p.name, RESET, DIM, p.desc, RESET);
+            } else {
+                println!("  {}{} ▶ {}{:<20}{}  {}{}（即将支持）{}", BOLD, CYAN, GRAY, p.name, RESET, DIM, GRAY, RESET);
+            }
+        } else if p.available {
+            println!("     {}{:<20}{}  {}{}{}", GRAY, p.name, RESET, DIM, p.desc, RESET);
+        } else {
+            println!("     {}{:<20}{}  {}（即将支持）{}", "\x1b[38;5;240m", p.name, RESET, "\x1b[38;5;240m", RESET);
+        }
+        lines += 1;
+    }
+    println!("  {}{}{}", GRAY, sep, RESET);
+    lines += 1;
+    lines
+}
+
+/// /login 统一登录入口：平台选择 → 直接登录（无需二次确认）
+pub async fn cmd_login_browser() -> Result<()> {
+    use crossterm::terminal::{enable_raw_mode, disable_raw_mode};
+    use crossterm::event::KeyCode;
+
+    let platforms = vec![
+        LoginPlatform { name: "Lark / 飞书",  desc: "扫码或账号登录飞书", available: true  },
+        LoginPlatform { name: "微信",          desc: "微信扫码登录",       available: false },
+        LoginPlatform { name: "企业微信",      desc: "企业微信账号登录",   available: false },
+    ];
+
+    // 预留渲染空间
+    let tui_reserve = 10usize;
+    for _ in 0..tui_reserve { println!(); }
+    print!("\x1b[{}A\x1b[0J", tui_reserve);
+    std::io::stdout().flush()?;
+
+    let mut sel = 0usize;
+    let mut list_lines = render_login_platforms(&platforms, sel);
+    std::io::stdout().flush()?;
+
+    enable_raw_mode()?;
+
+    loop {
+        match wait_key() {
+            Some(KeyCode::Esc) | Some(KeyCode::Char('q')) => {
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", list_lines);
+                std::io::stdout().flush()?;
+                println!("  {}已取消{}", GRAY, RESET);
+                println!();
+                return Ok(());
+            }
+            Some(KeyCode::Up) => {
+                sel = if sel > 0 { sel - 1 } else { platforms.len() - 1 };
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", list_lines);
+                list_lines = render_login_platforms(&platforms, sel);
+                std::io::stdout().flush()?;
+                enable_raw_mode()?;
+            }
+            Some(KeyCode::Down) => {
+                sel = (sel + 1) % platforms.len();
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", list_lines);
+                list_lines = render_login_platforms(&platforms, sel);
+                std::io::stdout().flush()?;
+                enable_raw_mode()?;
+            }
+            Some(KeyCode::Enter) => {
+                let platform = &platforms[sel];
+                disable_raw_mode()?;
+                print!("\x1b[{}A\x1b[0J", list_lines);
+                std::io::stdout().flush()?;
+
+                if !platform.available {
+                    println!("  {}「{}」暂未支持，敬请期待！{}", YELLOW, platform.name, RESET);
+                    println!();
+                    return Ok(());
+                }
+
+                // 直接执行登录，无需二次确认
+                match sel {
+                    0 => cmd_lark_login("").await?,
+                    _ => {
+                        println!("  {}「{}」暂未支持，敬请期待！{}", YELLOW, platform.name, RESET);
+                        println!();
+                    }
+                }
+                return Ok(());
+            }
+            None => break,
+            _ => {}
+        }
+    }
+
+    disable_raw_mode()?;
+    Ok(())
+}

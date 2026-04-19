@@ -22,6 +22,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp",      "列出已配置的 MCP 服务"),
     ("/skills",   "显示已加载的 skills"),
     ("/memory",   "列出/管理记忆"),
+    ("/auth",     "授权管理（飞书登录/状态/退出）"),
+    ("/login",    "用户登录授权（飞书/微信/企业微信，选择平台后确认）"),
     ("/clear",    "清屏"),
     ("/quit",     "退出 Numina"),
 ];

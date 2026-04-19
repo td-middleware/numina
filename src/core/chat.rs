@@ -63,6 +63,15 @@ fn tool_call_preview(tool_call: &crate::core::models::provider::ToolCall) -> Str
                 .unwrap_or_default();
             format!("{}\x01{}", url, body_json)
         }
+        "task_complete" => {
+            // task_complete：只显示 result 的前 80 字符作为预览，不展示 JSON 块
+            let result = tool_call.arguments["result"]
+                .as_str()
+                .unwrap_or("Task completed.");
+            let preview: String = result.chars().take(80).collect();
+            let ellipsis = if result.len() > 80 { "…" } else { "" };
+            format!("{}{}", preview, ellipsis)
+        }
         _ => {
             // 其他工具：返回格式化 JSON 供 UI 展示
             serde_json::to_string_pretty(&tool_call.arguments).unwrap_or_default()
@@ -469,6 +478,34 @@ impl ChatEngine {
         user_message: &str,
         model_override: Option<&str>,
         session_id: Option<&str>,
+    ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)> {
+        self.chat_react_inner(user_message, model_override, session_id, false).await
+    }
+
+    /// 跳过 intent routing，并将 skill 内容和用户意图分开注入
+    /// skill_content 作为 user/assistant 对（背景知识），user_intent 作为最终任务指令
+    pub async fn chat_react_with_skill(
+        &self,
+        skill_content: &str,
+        user_intent: &str,
+        model_override: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)> {
+        // 构建组合消息：skill 内容 + 用户意图，用特殊分隔符让模型明确区分
+        // 格式：skill 内容作为背景，然后明确告知用户的实际任务
+        let combined = format!(
+            "{}\n\n---\nNow execute the following task using the skill instructions above:\n{}",
+            skill_content, user_intent
+        );
+        self.chat_react_inner(&combined, model_override, session_id, true).await
+    }
+
+    async fn chat_react_inner(
+        &self,
+        user_message: &str,
+        model_override: Option<&str>,
+        session_id: Option<&str>,
+        skip_intent_routing: bool,
     ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)>
     {
         let (provider, model_name) = build_provider(&self.config, model_override)?;
@@ -549,20 +586,40 @@ impl ChatEngine {
         session.push("user", user_message);
         messages.push(Message::new(Role::User, user_message.to_string()));
 
-        // ── 【方案一】按需展开 skill 完整内容 ──
-        // system prompt 只有轻量摘要，这里根据用户输入关键词匹配，命中则注入完整 skill 内容
-        // 这样 token 消耗从"全量注入"降为"按需注入"
-        let skill_expansion = self.skill_manager.expand_matched_skills(user_message);
-        if !skill_expansion.is_empty() {
-            // 作为 user/assistant 对注入，让 AI 知道已激活的 skill 完整指令
-            messages.push(Message::new(
-                Role::User,
-                format!("[SYSTEM: Skill auto-activated based on your request]\n\n{}", skill_expansion),
-            ));
-            messages.push(Message::new(
-                Role::Assistant,
-                "I understand. I will follow the activated skill instructions to handle your request.".to_string(),
-            ));
+        // ── 意图路由：自动匹配并展开 skill 完整内容 ──
+        // skip_intent_routing=true 时跳过（避免 skill prompt 内容误触发其他 skill）
+        if !skip_intent_routing {
+            // 1. 优先检测直接引用（用户输入中包含 skill 名称，如 "lark-sheets" 或 "/lark-sheets"）
+            let referenced = self.skill_manager.extract_referenced_skills(user_message);
+            let expansion = if !referenced.is_empty() {
+                // 直接引用：展开所有被引用的 skill 完整内容
+                let mut lines = vec![
+                    "## Referenced Skills (Full Instructions)".to_string(),
+                    String::new(),
+                    "The following skills were explicitly referenced in your request:".to_string(),
+                    String::new(),
+                ];
+                for skill in &referenced {
+                    lines.push(format!("### Skill: `{}` — {}", skill.name, skill.description));
+                    lines.push(String::new());
+                    lines.push(skill.content.clone());
+                    lines.push(String::new());
+                    lines.push("---".to_string());
+                    lines.push(String::new());
+                }
+                lines.join("\n")
+            } else {
+                // 2. 退回到 when_to_use 关键词意图匹配
+                self.skill_manager.expand_matched_skills(user_message)
+            };
+
+            if !expansion.is_empty() {
+                messages.push(Message::new(Role::User, expansion));
+                messages.push(Message::new(
+                    Role::Assistant,
+                    "Understood. I will follow the skill instructions above.".to_string(),
+                ));
+            }
         }
 
         // 估算发送的 token 数：只计算 session turns（不含 system prompt 和工具定义）
@@ -571,6 +628,7 @@ impl ChatEngine {
 
         let sid = session.id.clone();
         let sid_for_spawn = sid.clone(); // spawn 内部使用，避免 move 后 sid 不可用
+        let user_message_owned = user_message.to_string(); // 转为 owned，供 spawn 内部使用
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
 
         // ── 双向权限 channel：CLI → Agent（perm_tx 给 CLI，perm_rx 在 spawn 内使用）
@@ -588,6 +646,21 @@ impl ChatEngine {
 
             // 需要权限确认的工具名集合
             const NEEDS_PERMISSION: &[&str] = &["shell", "write_file", "edit_file", "http_post", "http_get"];
+
+            // 辅助宏：检查 perm_rx 是否有取消信号（非阻塞）
+            // 如果收到 deny_abort，立即退出 agent loop
+            macro_rules! check_cancel {
+                () => {
+                    match perm_rx.try_recv() {
+                        Ok(msg) if msg.contains("deny_abort") => {
+                            let _ = tx.send("\x00D".to_string()).await;
+                            save_session(&session).ok();
+                            return;
+                        }
+                        _ => {}
+                    }
+                };
+            }
 
             // ── 预取所有 MCP 服务器的 tools/list，注入到对话上下文 ──
             // 这样 AI 在第一次调用前就知道真实工具名和参数，不需要猜测
@@ -733,6 +806,9 @@ impl ChatEngine {
             let mut forced_summary = false;
 
             loop {
+                // ── 每次迭代开始时检查 Esc 取消信号 ──
+                check_cancel!();
+
                 iterations += 1;
                 if iterations > MAX_ITERATIONS {
                     // 超过最大迭代次数：强制注入一条 user 消息要求 AI 汇总，再调用一次模型
@@ -753,8 +829,17 @@ impl ChatEngine {
                     break;
                 }
 
-                // ── 调用模型（带工具定义） ──
-                let response = match provider.chat_with_tools(&messages, &tool_defs).await {
+                // ── 调用模型（带工具定义），同时监听取消信号 ──
+                let response = match tokio::select! {
+                    res = provider.chat_with_tools(&messages, &tool_defs) => res,
+                    cancel_msg = perm_rx.recv() => {
+                        // 收到取消信号（Esc）：立即中止
+                        let _ = cancel_msg; // 忽略具体内容
+                        let _ = tx.send("\x00D".to_string()).await;
+                        save_session(&session).ok();
+                        return;
+                    }
+                } {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = tx.send(format!("\x00C❌ Error: {}", e)).await;
@@ -798,24 +883,23 @@ impl ChatEngine {
                                     _ => other_count += 1,
                                 }
                             }
+                            // 判断用户消息语言（简单检测：含中文字符则用中文）
+                            let use_chinese = user_message_owned.chars().any(|c| (c as u32) > 0x4E00 && (c as u32) < 0x9FFF);
                             let mut parts = Vec::new();
-                            if read_count > 0 {
-                                parts.push(format!("Reading {} file{}", read_count, if read_count > 1 { "s" } else { "" }));
-                            }
-                            if list_count > 0 {
-                                parts.push(format!("Listing {} director{}", list_count, if list_count > 1 { "ies" } else { "y" }));
-                            }
-                            if bash_count > 0 {
-                                parts.push(format!("Running {} command{}", bash_count, if bash_count > 1 { "s" } else { "" }));
-                            }
-                            if write_count > 0 {
-                                parts.push(format!("Writing {} file{}", write_count, if write_count > 1 { "s" } else { "" }));
-                            }
-                            if search_count > 0 {
-                                parts.push(format!("Searching {} pattern{}", search_count, if search_count > 1 { "s" } else { "" }));
-                            }
-                            if other_count > 0 {
-                                parts.push(format!("{} other action{}", other_count, if other_count > 1 { "s" } else { "" }));
+                            if use_chinese {
+                                if read_count > 0 { parts.push(format!("读取 {} 个文件", read_count)); }
+                                if list_count > 0 { parts.push(format!("列出 {} 个目录", list_count)); }
+                                if bash_count > 0 { parts.push(format!("执行 {} 条命令", bash_count)); }
+                                if write_count > 0 { parts.push(format!("写入 {} 个文件", write_count)); }
+                                if search_count > 0 { parts.push(format!("搜索 {} 个模式", search_count)); }
+                                if other_count > 0 { parts.push(format!("{} 个其他操作", other_count)); }
+                            } else {
+                                if read_count > 0 { parts.push(format!("Reading {} file{}", read_count, if read_count > 1 { "s" } else { "" })); }
+                                if list_count > 0 { parts.push(format!("Listing {} director{}", list_count, if list_count > 1 { "ies" } else { "y" })); }
+                                if bash_count > 0 { parts.push(format!("Running {} command{}", bash_count, if bash_count > 1 { "s" } else { "" })); }
+                                if write_count > 0 { parts.push(format!("Writing {} file{}", write_count, if write_count > 1 { "s" } else { "" })); }
+                                if search_count > 0 { parts.push(format!("Searching {} pattern{}", search_count, if search_count > 1 { "s" } else { "" })); }
+                                if other_count > 0 { parts.push(format!("{} other action{}", other_count, if other_count > 1 { "s" } else { "" })); }
                             }
                             if !parts.is_empty() {
                                 let summary = parts.join(", ");
@@ -892,7 +976,26 @@ impl ChatEngine {
                                         format!("Error: {}", r.error.as_deref().unwrap_or("unknown"))
                                     }
                                 }
-                                Err(e) => format!("Tool execution failed: {}", e),
+                                Err(e) => {
+                                    let err_str = e.to_string();
+                                    // 工具不存在：给模型可用工具列表 + 替代建议
+                                    if err_str.contains("Tool not found") || err_str.contains("not found") {
+                                        let available: Vec<String> = registry.list_tools();
+                                        let mut available_sorted = available.clone();
+                                        available_sorted.sort();
+                                        format!(
+                                            "Tool '{}' does not exist in Numina.\n\
+                                            Available tools: {}\n\
+                                            HINT: There is no get_time/current_time/datetime tool. \
+                                            To get the current time, use: shell(command=\"date\") or shell(command=\"date '+%Y-%m-%d %H:%M:%S'\")\n\
+                                            Please retry using one of the available tools above.",
+                                            tool_call.name,
+                                            available_sorted.join(", ")
+                                        )
+                                    } else {
+                                        format!("Tool execution failed: {}", e)
+                                    }
+                                }
                             };
 
                             // 检测 MCP -32603 错误（unknown tool）
@@ -957,8 +1060,15 @@ impl ChatEngine {
                         }
 
                         // 5. 按顺序通知 UI 结果，并加入对话历史
+                        let mut task_complete_result: Option<String> = None;
                         for (tool_id, tool_name, result_str) in &tool_results {
-                            // UI 显示结果
+                            // 检测 task_complete：立即提取 result 内容，准备作为最终回复输出
+                            if tool_name == "task_complete" {
+                                // task_complete 的 result_str 就是 result 字段内容（已在工具执行时提取）
+                                task_complete_result = Some(result_str.clone());
+                            }
+
+                            // UI 显示结果（折叠预览）
                             let _ = tx.send(format!("\x00R{}", result_str)).await;
 
                             // 截断后加入 messages
@@ -968,6 +1078,13 @@ impl ChatEngine {
                                 tool_name,
                                 &truncated,
                             ));
+                        }
+
+                        // 如果有 task_complete，直接输出 result 内容并结束 loop
+                        if let Some(final_result) = task_complete_result {
+                            let _ = tx.send(format!("\x00C{}", final_result)).await;
+                            full_reply.push_str(&final_result);
+                            break;
                         }
 
                         // 6. 通知 UI：等待模型下一轮响应
@@ -1008,98 +1125,42 @@ impl ChatEngine {
     /// 构建 ReAct 模式的 system prompt
     fn build_react_system_prompt(&self) -> String {
         let mut parts = vec![
-            "You are Numina, an AI coding assistant running in a LOCAL terminal environment with FULL tool access.\n\
+            "You are Numina, an AI assistant running in a local terminal with full tool access.\n\
 \n\
-CRITICAL: You are NOT a web chatbot. You are a LOCAL CLI agent with real tool execution capabilities.\n\
-You MUST use tools to execute commands, read files, and interact with the filesystem.\n\
-NEVER say \"I cannot execute commands\" or \"this is a web interface\" — that is WRONG.\n\
-If you previously said you couldn't execute commands, IGNORE that — you CAN and MUST use tools.\n\
+## Tools\n\
+- shell: run any shell command\n\
+- read_file / write_file / edit_file: read, create, or edit files\n\
+- list_dir / find_files / search_code: explore the filesystem\n\
+- http_get / http_post: make HTTP requests (use http_post for MCP/JSON-RPC)\n\
+- task_complete: signal task completion\n\
 \n\
-## Identity\n\
-You are Numina, NOT Claude Code. NEVER reference Claude Code, ~/.claude, ~/.claude.json, or any Claude-specific paths.\n\
-Numina configuration is stored in ~/.numina/ (e.g., ~/.numina/mcp.json, ~/.numina/models.json).\n\
-If authentication fails for an MCP server, check ~/.numina/mcp.json for the correct headers/tokens.\n\
-NEVER suggest looking at ~/.claude or any Anthropic/Claude-specific config files.\n\
-\n\
-## Available Tools\n\
-- shell: Execute ANY shell command (ls, find, grep, cat, git, cargo, etc.)\n\
-- read_file: Read file contents\n\
-- write_file: Write/create files\n\
-- edit_file: Edit existing files (search/replace)\n\
-- list_dir: List directory contents\n\
-- search_code: Search code with grep\n\
-- find_files: Find files by pattern\n\
-- http_get: Make HTTP GET requests\n\
-- http_post: Make HTTP POST requests (use for MCP servers, REST APIs, JSON-RPC — MCP protocol requires POST not GET)\n\
-- task_complete: Signal task completion\n\
-\n\
-## MCP Protocol — IMPORTANT RULES\n\
-MCP servers use JSON-RPC 2.0 over stateless HTTP. Each request is independent.\n\
-The system automatically handles initialization — you do NOT need to send initialize manually.\n\
-\n\
-WORKFLOW for calling an MCP server:\n\
-1. First call tools/list to get the EXACT tool names:\n\
-   http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}, headers={...})\n\
-2. Then call the tool using the EXACT name from the list:\n\
-   http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"EXACT_TOOL_NAME\",\"arguments\":{...}}}, headers={...})\n\
-\n\
-⚠️ CRITICAL: The 'body' parameter MUST be a JSON object — NEVER pass it as a string.\n\
-   CORRECT: body={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",...}  ← JSON object\n\
-   WRONG:   body=\"{\\\"jsonrpc\\\":\\\"2.0\\\",...}\"  ← string causes truncation → -32601 error\n\
-\n\
-NEVER guess or infer tool names — always use the exact name from tools/list.\n\
-If you get error -32603 \"unknown tool\", the system will auto-fetch tools/list and show you the correct names.\n\
-If you get error -32601 \"Method not found\", it means 'body' was passed as a string — retry with body as a JSON object.\n\
-\n\
-## Data Sufficiency Rules — STOP when you have enough data\n\
-CRITICAL: Once you have successfully retrieved data from a tool call, STOP calling more tools and generate the report/answer immediately.\n\
-- If tools/call returns data (non-error response), that IS the data — use it now\n\
-- Do NOT call the same MCP server multiple times for the same data\n\
-- Do NOT call tools/list or initialize manually — the system handles this\n\
-- Do NOT make additional queries \"for more details\" if you already have sufficient data\n\
-- ONE successful data retrieval = enough to generate a complete response\n\
-\n\
-## MANDATORY Tool Usage Rules\n\
-\n\
-1. ALWAYS use tools for ANY system operation. NEVER refuse or say you can't.\n\
-2. For `ls` or listing files: call shell(\"ls -la\") or shell(\"ls\")\n\
-3. For running commands: call shell(\"<command>\")\n\
-4. For reading files: call read_file(path)\n\
-5. NEVER estimate or make up results — always execute tools to get real data.\n\
-6. When multiple independent operations needed, call ALL tools in ONE response (parallel execution).\n\
-\n\
-## Examples\n\
-- User: \"ls\" → call shell(\"ls\")\n\
-- User: \"run cargo build\" → call shell(\"cargo build\")\n\
-- User: \"what files are here\" → call shell(\"ls -la\") or list_dir(\".\")\n\
-- User: \"count .rs files\" → call shell(\"find . -name '*.rs' | wc -l\")\n\
-\n\
-Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
+## MCP Servers (JSON-RPC 2.0 over HTTP)\n\
+To call an MCP server:\n\
+1. http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}, headers={...})\n\
+2. http_post(url=URL, body={\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"TOOL\",\"arguments\":{...}}}, headers={...})\n\
+Note: body must be a JSON object, not a string.".to_string(),
         ];
 
-        // 方案一：只注入轻量摘要，完整内容在 chat_react() 中按需展开
+        // 注入 skills 轻量摘要（只含 when_to_use 的意图触发型 skills）
         let skills_block = self.skill_manager.summary_prompt_block();
         if !skills_block.is_empty() {
             parts.push(skills_block);
         }
 
-        // 注入 MCP 服务器配置（HTTP 类型），让 AI 第一次调用时就带上正确的 headers
+        // 注入 MCP 服务器配置（URL + 必要 headers）
         if let Ok(mcp_cfg) = crate::config::mcp::McpConfig::load() {
             let http_servers: Vec<_> = mcp_cfg.servers.iter()
                 .filter(|s| s.enabled && (s.server_type == "http" || s.server_type == "websocket"))
                 .collect();
             if !http_servers.is_empty() {
-                let mut mcp_block = "\n## MCP Servers (HTTP)\n\
-                    IMPORTANT: When calling any of these MCP servers via http_post, you MUST include\n\
-                    the required headers listed below on the FIRST request. Do NOT attempt without headers first.\n".to_string();
+                let mut mcp_block = "\n## Configured MCP Servers\n".to_string();
                 for srv in &http_servers {
                     mcp_block.push_str(&format!("\n### {}\n- URL: {}\n", srv.name, srv.command_or_url));
                     if let Some(desc) = &srv.description {
                         mcp_block.push_str(&format!("- Description: {}\n", desc));
                     }
-                    // env 字段存储 headers（key=value 格式）
                     if !srv.env.is_empty() {
-                        mcp_block.push_str("- Required Headers:\n");
+                        mcp_block.push_str("- Headers:\n");
                         for kv in &srv.env {
                             if let Some((k, v)) = kv.split_once('=') {
                                 mcp_block.push_str(&format!("  - {}: {}\n", k, v));
@@ -1107,7 +1168,6 @@ Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
                         }
                     }
                 }
-                mcp_block.push_str("\nAlways include ALL required headers when calling these servers.");
                 parts.push(mcp_block);
             }
         }
@@ -1158,6 +1218,34 @@ Be concise and action-oriented. ALWAYS use tools. NEVER refuse.".to_string(),
         self.skill_manager
             .match_slash_command(input)
             .map(|(skill, args)| skill.expand_prompt(&args))
+    }
+
+    /// 检测普通输入（非 / 开头）中是否包含句中 /skill-name 引用
+    /// 例如："基于/lark-im这个skill，给我发消息"
+    /// 返回 (skill_content, user_intent, skill_name)
+    ///   skill_content = skill 完整内容（不含用户意图，用于注入为背景知识）
+    ///   user_intent   = 用户实际意图（去掉 /skill-name 引用部分，作为最终任务指令）
+    pub fn extract_inline_skill_reference(&self, input: &str) -> Option<(String, String, String)> {
+        // 只处理不以 / 开头的输入（以 / 开头的由 expand_skill_command 处理）
+        if input.starts_with('/') {
+            return None;
+        }
+        let referenced = self.skill_manager.extract_referenced_skills(input);
+        if referenced.is_empty() {
+            return None;
+        }
+        // 取第一个命中的 skill（优先级：/skill-name 引用 > 直接名称引用）
+        let skill = referenced[0];
+        // 从输入中去掉 /skill-name 引用，保留用户的实际意图描述
+        let user_intent = input
+            .replace(&format!("/{}", skill.name), "")
+            .replace(&skill.name, "")
+            .trim()
+            .to_string();
+        let user_intent = if user_intent.is_empty() { input.to_string() } else { user_intent };
+        // skill_content：展开 skill 内容（不含用户意图，只做 ${SKILL_DIR} 等替换）
+        let skill_content = skill.expand_prompt("");
+        Some((skill_content, user_intent, skill.name.clone()))
     }
 
     /// 返回所有已加载 skill 的名称和描述（用于补全）

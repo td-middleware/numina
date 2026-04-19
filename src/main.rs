@@ -12,6 +12,8 @@ mod config;
 mod utils;
 // Memory — 跨会话持久化记忆
 mod memory;
+// Channel — 用户输入渠道（飞书、微信等）
+mod channel;
 
 #[derive(Parser)]
 #[command(name = "numina")]

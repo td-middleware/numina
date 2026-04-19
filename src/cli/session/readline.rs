@@ -43,15 +43,67 @@ fn visible_columns(s: &str) -> usize {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                for inner in chars.by_ref() {
-                    if inner.is_ascii_alphabetic() {
-                        break;
+            match chars.peek() {
+                Some(&'[') => {
+                    // CSI 序列：\x1b[ ... <letter>
+                    chars.next(); // 跳过 '['
+                    for inner in chars.by_ref() {
+                        if inner.is_ascii_alphabetic() {
+                            break;
+                        }
                     }
                 }
-            } else {
-                chars.next();
+                Some(&']') => {
+                    // OSC 序列：\x1b] ... \x07  或  \x1b] ... \x1b\\
+                    // iTerm2 inline image 协议：\x1b]1337;File=inline=1;width=N;...:<base64>\x07
+                    // 需要解析 width=N 参数来确定图片占用的列数
+                    // 优化：只收集参数部分（: 之前），遇到 : 后直接跳过剩余内容（base64 可能很大）
+                    chars.next(); // 跳过 ']'
+                    let mut params_buf = String::new();
+                    let mut found_colon = false; // 是否已遇到 : （base64 开始）
+                    let mut is_iterm2 = false;
+                    loop {
+                        match chars.next() {
+                            None => break,
+                            Some('\x07') => break, // BEL 终止符
+                            Some('\x1b') => {
+                                // ST 终止符 \x1b\\
+                                if chars.peek() == Some(&'\\') {
+                                    chars.next();
+                                }
+                                break;
+                            }
+                            Some(':') if !found_colon => {
+                                // 遇到 : 说明参数部分结束，后面是 base64 数据
+                                found_colon = true;
+                                // 检查是否是 iTerm2 协议
+                                is_iterm2 = params_buf.starts_with("1337;");
+                            }
+                            Some(ch) if !found_colon => {
+                                params_buf.push(ch);
+                            }
+                            Some(_) => {
+                                // base64 内容，跳过（不收集）
+                            }
+                        }
+                    }
+                    // 解析 iTerm2 inline image 的 width=N 参数
+                    // 格式：1337;File=inline=1;width=N;height=M;...
+                    if is_iterm2 {
+                        for param in params_buf.split(';') {
+                            if let Some(val) = param.strip_prefix("width=") {
+                                if let Ok(n) = val.parse::<usize>() {
+                                    cols += n;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // 其他 OSC 序列（如 OSC 0 设置标题等）不占可见列数
+                }
+                _ => {
+                    chars.next(); // 跳过下一个字符
+                }
             }
         } else {
             let w = unicode_char_width(c);

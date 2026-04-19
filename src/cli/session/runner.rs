@@ -3,13 +3,14 @@ use std::io::Write;
 
 use crate::config::ModelsConfig;
 use crate::core::chat::ChatEngine;
+use crate::core::intent::{clarify_intent, IntentAnalyzer, TuiIntentClarifier};
 
-use super::commands::{cmd_mcp_browser, cmd_model_picker, cmd_sessions};
+use super::commands::{cmd_auth_browser, cmd_login_browser, cmd_lark_login, cmd_mcp_browser, cmd_model_picker, cmd_sessions, check_lark_login_expiry};
 use super::file_ref::expand_at_references;
 use super::permission::{read_permission_choice_interactive, read_permission_choice_mcp};
 use super::readline::{interactive_readline, ReadLine};
 use super::renderer::{
-    estimate_context_size, print_context_bar, print_help, print_welcome,
+    draw_user_badge_top_right, estimate_context_size, print_context_bar, print_help, print_welcome,
     BOLD, BRIGHT_WHITE, CODE_BG, CODE_FG, CYAN, DIM, GRAY, GREEN, RESET, YELLOW,
 };
 
@@ -150,6 +151,19 @@ fn poll_expand_key(expandable: &mut Vec<String>) -> bool {
     false
 }
 
+/// 非阻塞检测 Esc 键（agent 思考过程中中断）
+/// 返回 true 表示用户按下了 Esc
+fn poll_esc_key() -> bool {
+    use crossterm::event::{poll, read, Event, KeyCode, KeyEvent};
+    use std::time::Duration;
+    if poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(KeyEvent { code: KeyCode::Esc, .. })) = read() {
+            return true;
+        }
+    }
+    false
+}
+
 // ─────────────────────────────────────────────
 // MCP 权限辅助：从 cmd 中解析 MCP server/tool/args
 // ─────────────────────────────────────────────
@@ -248,7 +262,7 @@ pub fn clear_last_session_id() {
 // 单次消息
 // ─────────────────────────────────────────────
 
-pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs) -> Result<()> {
+pub async fn run_single_message(engine: &std::sync::Arc<ChatEngine>, msg: &str, args: &ChatArgs) -> Result<()> {
     println!("{}{}You{} {}", BOLD, GREEN, RESET, msg);
     println!();
 
@@ -256,7 +270,7 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
     let session_id = args.session.as_deref();
 
     match engine.chat_react(msg, model_override, session_id).await {
-        Ok((mut rx, _perm_tx, sid, sent_tokens, ctx_window)) => {
+        Ok((mut rx, perm_tx, sid, sent_tokens, ctx_window)) => {
             let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
             let _spinner = tokio::spawn(async move {
                 let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -304,6 +318,20 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
 
                 // 非阻塞检测 ctrl+o 展开折叠结果
                 poll_expand_key(&mut expandable_results);
+
+                // 非阻塞检测 Esc 键：agent 思考/执行过程中按 Esc 强制中断
+                if poll_esc_key() {
+                    stop_thinking!();
+                    print!("\r\x1b[2K");
+                    println!("  {}⚡ 已中断（Esc）{}", YELLOW, RESET);
+                    std::io::stdout().flush().ok();
+                    let _ = perm_tx.send("__esc__|deny_abort".to_string()).await;
+                    // 等待 agent loop 发送 \x00D 确认退出
+                    while let Some(ev) = rx.recv().await {
+                        if ev == "\x00D" { break; }
+                    }
+                    break;
+                }
 
                 if event == "\x00D" {
                     stop_thinking!();
@@ -359,7 +387,7 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
                         _ => format!("{}|deny", perm_id),
                     };
                     println!();
-                    let _ = _perm_tx.send(reply).await;
+                    let _ = perm_tx.send(reply).await;
                 } else if let Some(tool_info) = event.strip_prefix("\x00T") {
                     stop_thinking!();
                     render_tool_call(tool_info);
@@ -486,7 +514,7 @@ pub async fn run_single_message(engine: &ChatEngine, msg: &str, args: &ChatArgs)
 // ─────────────────────────────────────────────
 
 pub async fn run_interactive_with_session(
-    engine: &ChatEngine,
+    engine: &std::sync::Arc<ChatEngine>,
     args: &ChatArgs,
     initial_session: Option<String>,
 ) -> Result<()> {
@@ -514,9 +542,43 @@ pub async fn run_interactive_with_session(
     };
 
     loop {
-        let prompt = "❯ ";
+        // 构建输入提示符：如果已登录飞书，在 ❯ 左侧显示彩色首字母头像方块
+        // 注意：rustyline 要求用 \x01...\x02 包裹不可见的 ANSI 转义码，
+        // 否则会计算错误的光标位置导致显示错乱
+        let prompt = if let Some(user) = crate::cli::session::commands::load_lark_user_cache() {
+            let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
+            // 取最多5个字符的显示名
+            let display_name: String = user.name.chars().take(5).collect();
+            // 彩色首字母方块（所有终端通用）
+            let colors: &[u8] = &[33, 36, 38, 64, 70, 125, 130, 160, 166, 172, 196, 202, 208];
+            let hash = user.name.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            let color = colors[(hash as usize) % colors.len()];
 
-        let input = match interactive_readline(prompt, &mut chat_history) {
+            if term_program == "iTerm.app" {
+                // iTerm2：优先使用圆形头像 inline image（width=2），退回彩色首字母方块
+                // visible_columns 会解析 width=N 参数，光标位置计算正确
+                let avatar_seq = if let Some(path) = crate::cli::session::commands::lark_avatar_circle_path() {
+                    crate::cli::session::renderer::iterm2_inline_image_from_file(&path, 1)
+                } else if let Some(path) = crate::cli::session::commands::lark_avatar_cache_path() {
+                    crate::cli::session::renderer::iterm2_inline_image_from_file(&path, 1)
+                } else {
+                    String::new()
+                };
+                if !avatar_seq.is_empty() {
+                    format!("{} ❯ ", avatar_seq)
+                } else {
+                    let first_char = user.name.chars().next().unwrap_or('?');
+                    format!("\x1b[48;5;{}m\x1b[97m {} \x1b[0m ❯ ", color, first_char)
+                }
+            } else {
+                // macOS Terminal.app 及其他终端：绿色背景 + 白字全名（最多5字）+ ❯
+                format!("\x1b[42m\x1b[97m {} \x1b[0m ❯ ", display_name)
+            }
+        } else {
+            "❯ ".to_string()
+        };
+
+        let input = match interactive_readline(&prompt, &mut chat_history) {
             Ok(ReadLine::Line(line)) => {
                 let trimmed = line.trim().to_string();
                 // readline 已在内部将序列化历史格式推入 chat_history，
@@ -701,6 +763,19 @@ pub async fn run_interactive_with_session(
                 println!();
                 continue;
             }
+            "/auth" => {
+                cmd_auth_browser().await?;
+                continue;
+            }
+            "/login" => {
+                cmd_login_browser().await?;
+                continue;
+            }
+            _ if input.starts_with("/login ") => {
+                let args_str = &input["/login ".len()..];
+                cmd_lark_login(args_str).await?;
+                continue;
+            }
             "/clear" => {
                 // 清屏 + 重置 session（上下文归零，下次对话重新开始）
                 current_session = None;
@@ -724,14 +799,18 @@ pub async fn run_interactive_with_session(
             }
             _ if input.starts_with('/') => {
                 // 先检查是否是 skill 斜杠命令
-                if let Some(expanded) = engine.expand_skill_command(input) {
-                    // 是 skill 命令：用展开后的 prompt 发送给模型
+                if let Some(skill_content) = engine.expand_skill_command(input) {
+                    // 是 skill 命令：skill 内容作为背景，/skill-name 后面的参数作为用户意图
                     let skill_name = &input[1..input.find(' ').unwrap_or(input.len())];
+                    // 提取用户意图：/skill-name 后面的参数部分
+                    let user_intent = input.find(' ')
+                        .map(|pos| input[pos + 1..].trim().to_string())
+                        .unwrap_or_default();
                     println!("  {}▶ Skill: /{}{}", DIM, skill_name, RESET);
                     println!();
-                    // 直接跳到对话处理，使用展开后的 prompt
+                    // 使用 chat_react_with_skill 跳过 intent routing，避免 skill prompt 内容误触发其他 skill
                     match engine
-                        .chat_react(&expanded, model_override, current_session.as_deref())
+                        .chat_react_with_skill(&skill_content, &user_intent, model_override, current_session.as_deref())
                         .await
                     {
                         Ok((mut rx, perm_tx, sid, sent_tokens, ctx_window)) => {
@@ -774,6 +853,19 @@ pub async fn run_interactive_with_session(
                                     tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                                     print!("\r\x1b[2K");
                                     std::io::stdout().flush().ok();
+                                }
+                                // 非阻塞检测 Esc 键：agent 思考/执行过程中按 Esc 强制中断
+                                if poll_esc_key() {
+                                    stop_thinking_skill!();
+                                    print!("\r\x1b[2K");
+                                    println!("  {}⚡ 已中断（Esc）{}", YELLOW, RESET);
+                                    std::io::stdout().flush().ok();
+                                    let _ = perm_tx.send("__esc__|deny_abort".to_string()).await;
+                                    // 等待 agent loop 发送 \x00D 确认退出
+                                    while let Some(ev) = rx.recv().await {
+                                        if ev == "\x00D" { break; }
+                                    }
+                                    break;
                                 }
                                 if event == "\x00D" { stop_thinking_skill!(); break; }
                                 else if event == "\x00W" {
@@ -931,6 +1023,244 @@ pub async fn run_interactive_with_session(
         }
         let input = expanded_input.as_str();
 
+        // ── 检测句中 /skill-name 引用（明确指定 skill，不以 / 开头的普通输入）──
+        // 例如："基于/lark-im这个skill，给我发消息"
+        // 提取 skill 内容 + 用户原始意图，走和句首 /skill-name 一样的路径
+        // 注意：使用 chat_react_with_skill 跳过 intent routing，避免 skill prompt 内容误触发其他 skill
+        if let Some((skill_content, user_intent, skill_name)) = engine.extract_inline_skill_reference(input) {
+            println!("  {}▶ Skill: /{}{}", DIM, skill_name, RESET);
+            println!();
+            match engine
+                .chat_react_with_skill(&skill_content, &user_intent, model_override, current_session.as_deref())
+                .await
+            {
+                Ok((mut rx, perm_tx, sid, sent_tokens, ctx_window)) => {
+                    println!();
+                    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+                    let _spinner_handle = tokio::spawn(async move {
+                        let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+                        let mut i = 0usize;
+                        loop {
+                            if stop_rx.try_recv().is_ok() {
+                                print!("\r\x1b[2K");
+                                std::io::stdout().flush().ok();
+                                break;
+                            }
+                            print!("\r  \x1b[36m{}\x1b[0m \x1b[2m∴ Thinking…\x1b[0m", frames[i % frames.len()]);
+                            std::io::stdout().flush().ok();
+                            i += 1;
+                            tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                        }
+                    });
+                    let mut full_response = String::new();
+                    let mut in_code_block = false;
+                    let mut code_block_buf = String::new();
+                    let mut line_buf = String::new();
+                    let mut stop_tx_opt = Some(stop_tx);
+                    let mut thinking_task: Option<tokio::task::JoinHandle<()>> = None;
+                    let mut expandable_results: Vec<String> = Vec::new();
+                    macro_rules! stop_thinking_inline {
+                        () => {
+                            if let Some(h) = thinking_task.take() {
+                                h.abort();
+                                tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                                print!("\r\x1b[2K");
+                                std::io::stdout().flush().ok();
+                            }
+                        };
+                    }
+                    while let Some(event) = rx.recv().await {
+                        if let Some(tx) = stop_tx_opt.take() {
+                            let _ = tx.send(());
+                            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                            print!("\r\x1b[2K");
+                            std::io::stdout().flush().ok();
+                        }
+                        poll_expand_key(&mut expandable_results);
+                        // 非阻塞检测 Esc 键：agent 思考/执行过程中按 Esc 强制中断
+                        if poll_esc_key() {
+                            stop_thinking_inline!();
+                            print!("\r\x1b[2K");
+                            println!("  {}⚡ 已中断（Esc）{}", YELLOW, RESET);
+                            std::io::stdout().flush().ok();
+                            let _ = perm_tx.send("__esc__|deny_abort".to_string()).await;
+                            while let Some(ev) = rx.recv().await {
+                                if ev == "\x00D" { break; }
+                            }
+                            break;
+                        }
+                        if event == "\x00D" { stop_thinking_inline!(); break; }
+                        else if event == "\x00W" {
+                            stop_thinking_inline!();
+                            let h = tokio::spawn(async {
+                                let frames = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+                                let mut i = 0usize;
+                                loop {
+                                    print!("\r  \x1b[36m{}\x1b[0m \x1b[2m∴ Thinking…\x1b[0m", frames[i % frames.len()]);
+                                    std::io::stdout().flush().ok();
+                                    i += 1;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+                                }
+                            });
+                            thinking_task = Some(h);
+                        } else if let Some(thinking_text) = event.strip_prefix("\x00H") {
+                            stop_thinking_inline!();
+                            let preview: String = thinking_text.chars().take(60).collect();
+                            let ellipsis = if thinking_text.len() > 60 { "…" } else { "" };
+                            println!("  {}∴ {}{}{} {}(thinking){}", DIM, preview, ellipsis, RESET, DIM, RESET);
+                            std::io::stdout().flush()?;
+                        } else if let Some(summary) = event.strip_prefix("\x00S") {
+                            stop_thinking_inline!();
+                            println!("  {}⏺ {}{}  {}(ctrl+o to expand){}", DIM, summary, RESET, DIM, RESET);
+                            std::io::stdout().flush()?;
+                        } else if let Some(perm_info) = event.strip_prefix("\x00K") {
+                            stop_thinking_inline!();
+                            let parts: Vec<&str> = perm_info.splitn(4, '|').collect();
+                            let perm_id = parts.first().copied().unwrap_or("");
+                            let tool_name = parts.get(1).copied().unwrap_or("?");
+                            let cmd = parts.get(2).copied().unwrap_or("");
+                            println!();
+                            let tool_name_owned = tool_name.to_string();
+                            let cmd_owned = cmd.to_string();
+                            let decision = tokio::task::spawn_blocking(move || {
+                                if let Some((server_name, mcp_tool, args_json)) =
+                                    resolve_mcp_info(&tool_name_owned, &cmd_owned)
+                                {
+                                    read_permission_choice_mcp(&server_name, &mcp_tool, &args_json)
+                                } else {
+                                    read_permission_choice_interactive(&tool_name_owned, &cmd_owned)
+                                }
+                            }).await.unwrap_or(3);
+                            let reply = match decision {
+                                1 => format!("{}|allow", perm_id),
+                                2 => format!("{}|allow_session", perm_id),
+                                0 => format!("{}|deny_abort", perm_id),
+                                _ => format!("{}|deny", perm_id),
+                            };
+                            println!();
+                            let _ = perm_tx.send(reply).await;
+                        } else if let Some(tool_info) = event.strip_prefix("\x00T") {
+                            stop_thinking_inline!();
+                            render_tool_call(tool_info);
+                            std::io::stdout().flush()?;
+                        } else if let Some(result) = event.strip_prefix("\x00R") {
+                            let line_count = result.lines().count();
+                            let char_count = result.len();
+                            let should_fold = line_count > RESULT_FOLD_LINES || char_count > RESULT_FOLD_CHARS;
+                            if should_fold {
+                                println!("  {}  └─ {} line{}, {} chars  {}(ctrl+o to expand){}",
+                                    DIM, line_count, if line_count != 1 { "s" } else { "" }, char_count, RESET, RESET);
+                                expandable_results.push(result.to_string());
+                            } else {
+                                println!("  {}  └─ {} line{}, {} chars{}", DIM, line_count, if line_count != 1 { "s" } else { "" }, char_count, RESET);
+                                for line in result.lines().take(RESULT_FOLD_LINES) {
+                                    println!("  {}     {}{}", DIM, line, RESET);
+                                }
+                            }
+                            std::io::stdout().flush()?;
+                        } else if let Some(text) = event.strip_prefix("\x00C") {
+                            if full_response.is_empty() {
+                                println!();
+                                print!("{}{}Numina{} ", BOLD, CYAN, RESET);
+                                std::io::stdout().flush()?;
+                            }
+                            for ch in text.chars() {
+                                line_buf.push(ch);
+                                if ch == '\n' {
+                                    let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+                                    if trimmed.starts_with("```") {
+                                        if in_code_block {
+                                            let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                                            const CODE_FOLD_LINES: usize = 20;
+                                            if code_lines.len() > CODE_FOLD_LINES {
+                                                for line in &code_lines[..CODE_FOLD_LINES] {
+                                                    print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET);
+                                                }
+                                                println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                                            } else {
+                                                for line in &code_lines { print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET); }
+                                            }
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                            code_block_buf.clear();
+                                            in_code_block = false;
+                                        } else {
+                                            in_code_block = true;
+                                            code_block_buf.clear();
+                                            print!("{}{}{}{}\n", CODE_BG, CODE_FG, trimmed, RESET);
+                                        }
+                                    } else if in_code_block {
+                                        code_block_buf.push_str(trimmed);
+                                        code_block_buf.push('\n');
+                                    } else {
+                                        print!("{}\n", trimmed);
+                                    }
+                                    std::io::stdout().flush()?;
+                                    line_buf.clear();
+                                }
+                            }
+                            if !line_buf.is_empty() {
+                                if in_code_block { code_block_buf.push_str(&line_buf); } else { print!("{}", line_buf); }
+                                std::io::stdout().flush()?;
+                                line_buf.clear();
+                            }
+                            full_response.push_str(text);
+                        }
+                    }
+                    if in_code_block && !code_block_buf.is_empty() {
+                        let code_lines: Vec<&str> = code_block_buf.lines().collect();
+                        const CODE_FOLD_LINES: usize = 20;
+                        if code_lines.len() > CODE_FOLD_LINES {
+                            for line in &code_lines[..CODE_FOLD_LINES] { print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET); }
+                            println!("  {}  … {} more lines (folded){}", DIM, code_lines.len() - CODE_FOLD_LINES, RESET);
+                        } else {
+                            for line in &code_lines { print!("{}{}{}{}\n", CODE_BG, CODE_FG, line, RESET); }
+                        }
+                        print!("{}", RESET);
+                    }
+                    println!();
+                    println!();
+                    let current_tokens = ChatEngine::get_session(&sid)
+                        .map(|s| s.turns.iter().map(|t| t.content.len()).sum::<usize>() / 4)
+                        .unwrap_or_else(|_| sent_tokens + full_response.len() / 4);
+                    accumulated_tokens = current_tokens;
+                    print_context_bar(current_tokens, ctx_window);
+                    current_session = Some(sid.clone());
+                    save_last_session_id(&sid);
+                }
+                Err(e) => {
+                    eprintln!("\n{}❌ Error: {}{}\n", YELLOW, e, RESET);
+                }
+            }
+            continue;
+        }
+
+        // ── 意图澄清（可选）──
+        // 用模型分析用户输入是否明确，如果不明确则通过 TUI 交互让用户选择
+        let final_input: String = {
+            let analyzer = IntentAnalyzer::new(engine.clone());
+            let clarifier = TuiIntentClarifier::new();
+            match clarify_intent(&analyzer, &clarifier, input).await {
+                Ok(Some(refined)) if refined != input => {
+                    // 意图被精准化了，显示提示
+                    println!("  {}→ 执行：{}{}", DIM, refined, RESET);
+                    println!();
+                    refined
+                }
+                Ok(Some(refined)) => refined,
+                Ok(None) => {
+                    // 用户取消
+                    println!("  {}已取消{}", DIM, RESET);
+                    println!();
+                    continue;
+                }
+                Err(_) => {
+                    // 意图分析失败，直接用原始输入
+                    input.to_string()
+                }
+            }
+        };
+        let input = final_input.as_str();
+
         match engine
             .chat_react(input, model_override, current_session.as_deref())
             .await
@@ -985,6 +1315,19 @@ pub async fn run_interactive_with_session(
 
                     // 非阻塞检测 ctrl+o 展开折叠结果
                     poll_expand_key(&mut expandable_results);
+
+                    // 非阻塞检测 Esc 键：agent 思考/执行过程中按 Esc 强制中断
+                    if poll_esc_key() {
+                        stop_thinking!();
+                        print!("\r\x1b[2K");
+                        println!("  {}⚡ 已中断（Esc）{}", YELLOW, RESET);
+                        std::io::stdout().flush().ok();
+                        let _ = perm_tx.send("__esc__|deny_abort".to_string()).await;
+                        while let Some(ev) = rx.recv().await {
+                            if ev == "\x00D" { break; }
+                        }
+                        break;
+                    }
 
                     if event == "\x00D" {
                         stop_thinking!();
@@ -1167,6 +1510,50 @@ pub async fn run_interactive_with_session(
 }
 
 // ─────────────────────────────────────────────
+// 飞书登录过期提醒弹窗
+// ─────────────────────────────────────────────
+
+/// 显示飞书登录过期提醒，按 Enter 自动重新登录，按 Esc/q 跳过
+async fn show_login_expiry_prompt(hours: u64) {
+    use crossterm::event::{read as ev_read, Event, KeyCode, KeyEvent};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+
+    println!();
+    println!("  \x1b[33m╭─ ⚠️  飞书登录已过期 ────────────────────────────────\x1b[0m");
+    println!("  \x1b[33m│\x1b[0m");
+    println!("  \x1b[33m│\x1b[0m  距上次登录已超过 \x1b[1m{} 小时\x1b[0m，飞书 Token 可能已失效", hours);
+    println!("  \x1b[33m│\x1b[0m  飞书相关操作可能会失败，建议重新登录");
+    println!("  \x1b[33m│\x1b[0m");
+    println!("  \x1b[33m│\x1b[0m  \x1b[2m按 \x1b[0m\x1b[1mEnter\x1b[0m\x1b[2m 立即重新登录，或 \x1b[0m\x1b[1mEsc\x1b[0m\x1b[2m 稍后再说\x1b[0m");
+    println!("  \x1b[33m╰────────────────────────────────────────────────────\x1b[0m");
+    println!();
+    std::io::stdout().flush().ok();
+
+    let _ = enable_raw_mode();
+    let do_login = loop {
+        match ev_read() {
+            Ok(Event::Key(KeyEvent { code: KeyCode::Enter, .. })) => break true,
+            Ok(Event::Key(KeyEvent { code: KeyCode::Esc, .. })) => break false,
+            Ok(Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })) => break false,
+            Ok(Event::Key(KeyEvent { code: KeyCode::Char('c'), .. })) => break false,
+            _ => {}
+        }
+    };
+    let _ = disable_raw_mode();
+
+    if do_login {
+        println!("  \x1b[36m→ 正在启动飞书登录...\x1b[0m");
+        println!();
+        if let Err(e) = cmd_lark_login("").await {
+            eprintln!("  \x1b[33m⚠️  登录失败：{}\x1b[0m", e);
+        }
+    } else {
+        println!("  \x1b[2m已跳过，可随时输入 /login 重新登录\x1b[0m");
+        println!();
+    }
+}
+
+// ─────────────────────────────────────────────
 // 入口函数
 // ─────────────────────────────────────────────
 
@@ -1181,7 +1568,7 @@ pub async fn execute(args: &ChatArgs) -> Result<()> {
     }
 
     let engine = match ChatEngine::new() {
-        Ok(e) => e,
+        Ok(e) => std::sync::Arc::new(e),
         Err(err) => {
             eprintln!("{}⚠️  Failed to initialize ChatEngine: {}{}", YELLOW, err, RESET);
             eprintln!("   Run {}numina config init{} to set up your workspace.", BOLD, RESET);
@@ -1210,6 +1597,11 @@ pub async fn execute(args: &ChatArgs) -> Result<()> {
     let effective_session = args.session.clone().or(restored_session.clone());
 
     print_welcome(&model_name, skill_count, effective_session.as_deref(), true);
+
+    // 检测飞书登录是否过期（超过 8 小时），过期则弹窗提醒用户重新登录
+    if let Some(hours) = check_lark_login_expiry() {
+        show_login_expiry_prompt(hours).await;
+    }
 
     // 计算上下文窗口大小（用于显示 context bar）
     let ctx_window = {

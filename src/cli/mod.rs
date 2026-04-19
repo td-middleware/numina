@@ -9,6 +9,8 @@ pub mod model;
 pub mod mcp;
 pub mod collaborate;
 pub mod config;
+pub mod channel;
+pub mod auth;
 
 #[derive(Subcommand)]
 pub enum Commands {
@@ -33,6 +35,12 @@ pub enum Commands {
     /// Configuration management
     Config(config::ConfigArgs),
 
+    /// Channel management - subscribe to Lark/WeChat messages
+    Channel(channel::ChannelArgs),
+
+    /// Auth management - Lark/Feishu login authorization
+    Auth(auth::AuthArgs),
+
     /// Show Numina status and diagnostics
     Status,
 }
@@ -47,6 +55,8 @@ impl Commands {
             Commands::Mcp(args) => mcp::execute(args).await,
             Commands::Collaborate(args) => collaborate::execute(args).await,
             Commands::Config(args) => config::execute(args).await,
+            Commands::Channel(args) => channel::execute(args).await,
+            Commands::Auth(args) => auth::execute(args).await,
             Commands::Status => {
                 let models = crate::config::ModelsConfig::load().unwrap_or_default();
                 let mcp = crate::config::McpFileConfig::load().unwrap_or_default();

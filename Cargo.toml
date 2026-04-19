@@ -84,6 +84,9 @@ tokio-tungstenite = "0.26"
 governor = "0.7"
 backoff = { version = "0.4", features = ["tokio"] }
 
+# Image processing (圆形头像裁剪)
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 [dev-dependencies]
 tempfile = "3.14"
 mockall = "0.13"
