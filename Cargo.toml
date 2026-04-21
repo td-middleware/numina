@@ -11,6 +11,15 @@ authors = ["Numina Team"]
 name = "numina"
 path = "src/main.rs"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Features
+# ─────────────────────────────────────────────────────────────────────────────
+[features]
+# 云端部署模式：启用 HTTP API Server（axum）
+# 本地构建：cargo build --release
+# 云端构建：cargo build --release --features server
+server = ["axum", "tower", "tower-http", "async-stream"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
@@ -86,6 +95,12 @@ backoff = { version = "0.4", features = ["tokio"] }
 
 # Image processing (圆形头像裁剪)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# HTTP Server — 仅 `server` feature 启用时编译（云端部署）
+axum = { version = "0.8", features = ["macros"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"], optional = true }
+async-stream = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.14"

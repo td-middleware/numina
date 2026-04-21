@@ -1,0 +1,97 @@
+# =============================================================================
+# GitHub Actions — 自动构建并推送 Docker 镜像到 GHCR
+#
+# 触发条件：
+#   - push 到 main 分支 → 构建并推送 :latest 镜像
+#   - 打 v* tag（如 v0.2.0）→ 同时推送 :v0.2.0 和 :latest
+#   - PR → 只构建，不推送（验证 Dockerfile 正确性）
+#
+# 镜像地址：ghcr.io/td-middleware/numina:latest
+#
+# 云端服务器更新命令：
+#   docker compose pull && docker compose up -d
+# =============================================================================
+
+name: Docker Build & Push
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # td-middleware/numina
+
+jobs:
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 推送到 GHCR 需要
+
+    steps:
+      # ── 1. 检出代码 ──────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. 设置 QEMU（多平台构建支持，可选）────────────────────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # ── 3. 设置 Docker Buildx ────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 4. 登录 GHCR（PR 时跳过）────────────────────────────────────────
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 5. 提取镜像元数据（tag、label）──────────────────────────────────
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # main 分支 → :latest
+            type=raw,value=latest,enable={{is_default_branch}}
+            # v* tag → :v0.2.0
+            type=semver,pattern={{version}}
+            # v* tag → :0.2（minor）
+            type=semver,pattern={{major}}.{{minor}}
+            # PR → :pr-42
+            type=ref,event=pr
+
+      # ── 6. 构建并推送 ────────────────────────────────────────────────────
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          # PR 只构建不推送；push/tag 才推送
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 利用 GitHub Actions 缓存加速构建（Rust 依赖层）
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 构建平台（amd64 用于大多数云服务器）
+          platforms: linux/amd64
+
+      # ── 7. 输出镜像摘要 ──────────────────────────────────────────────────
+      - name: Image digest
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "✅ 镜像已推送："
+          echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | sed 's/^/  /'
+          echo ""
+          echo "云端更新命令："
+          echo "  docker compose pull && docker compose up -d"

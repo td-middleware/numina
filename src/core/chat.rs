@@ -479,7 +479,22 @@ impl ChatEngine {
         model_override: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)> {
-        self.chat_react_inner(user_message, model_override, session_id, false).await
+        self.chat_react_inner(user_message, model_override, session_id, false, false).await
+    }
+
+    /// 自动批准版本的 chat_react（用于飞书 channel 等无人值守场景）
+    ///
+    /// 与 chat_react 的区别：
+    /// - 所有需要权限确认的工具调用自动批准（allow_session 级别）
+    /// - 每个工具调用前后都用 tracing::info! 记录详细日志，便于问题定位
+    /// - 不会阻塞等待用户输入，适合后台自动处理
+    pub async fn chat_react_auto(
+        &self,
+        user_message: &str,
+        model_override: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)> {
+        self.chat_react_inner(user_message, model_override, session_id, false, true).await
     }
 
     /// 跳过 intent routing，并将 skill 内容和用户意图分开注入
@@ -497,7 +512,7 @@ impl ChatEngine {
             "{}\n\n---\nNow execute the following task using the skill instructions above:\n{}",
             skill_content, user_intent
         );
-        self.chat_react_inner(&combined, model_override, session_id, true).await
+        self.chat_react_inner(&combined, model_override, session_id, true, false).await
     }
 
     async fn chat_react_inner(
@@ -506,6 +521,7 @@ impl ChatEngine {
         model_override: Option<&str>,
         session_id: Option<&str>,
         skip_intent_routing: bool,
+        auto_approve: bool,
     ) -> Result<(tokio::sync::mpsc::Receiver<String>, tokio::sync::mpsc::Sender<String>, String, usize, usize)>
     {
         let (provider, model_name) = build_provider(&self.config, model_override)?;
@@ -637,6 +653,18 @@ impl ChatEngine {
         // ── 需要权限确认的工具集合 ──
         // 本 session 内已授权的工具（allow_session）
         let mut session_allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // auto_approve 模式：预先将所有需要权限的工具加入 session_allowed
+        // 这样在 agent loop 中不会触发权限确认流程
+        if auto_approve {
+            for tool in &["shell", "write_file", "edit_file", "http_post", "http_get"] {
+                session_allowed.insert(tool.to_string());
+            }
+            tracing::info!(
+                session_id = %sid,
+                "chat_react_auto: auto-approve mode enabled, all tools pre-authorized"
+            );
+        }
 
         // ── 在后台任务中运行 Agent Loop ──
         tokio::spawn(async move {
@@ -963,6 +991,15 @@ impl ChatEngine {
                             // 通知 UI 工具开始执行
                             let params_preview = tool_call_preview(tool_call);
                             let _ = tx.send(format!("\x00T{}|{}", tool_call.name, params_preview)).await;
+
+                            // auto_approve 模式：记录工具调用日志（便于问题定位）
+                            if auto_approve {
+                                tracing::info!(
+                                    tool = %tool_call.name,
+                                    params = %params_preview,
+                                    "auto_approve: executing tool (no permission required)"
+                                );
+                            }
 
                             // 执行工具
                             let mut result_str = match registry.execute(&tool_call.name, tool_call.arguments.clone()).await {

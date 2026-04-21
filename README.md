@@ -450,23 +450,202 @@ brew install --cask font-jetbrains-mono
 | 多 Agent 协作 | ✅ 完成 |
 | 一键安装脚本 | ✅ 完成 |
 | 飞书数据通道（Channel） | 🔄 开发中 |
+| 云端 HTTP Server（`--features server`） | ✅ 完成 |
 | 全屏 TUI 模式 | 🔄 规划中 |
 | 任务执行 Graph | 🔄 规划中 |
 | Skills 生成器（genskills） | 🔄 规划中 |
-| 云端托管 / 定时任务 | 🔄 规划中 |
 | Web GUI（`numina gui`） | 🔄 规划中 |
 
 ---
 
 ## 构建
 
+### 本地构建（CLI 工具，默认）
+
+本地构建不包含 HTTP Server，二进制更小，功能与以前完全一致：
+
 ```bash
 cargo check              # 检查代码
 cargo build              # 调试构建
-cargo build --release    # 发布构建（启用 LTO 优化）
+cargo build --release    # 发布构建（启用 LTO 优化，~10MB）
 cargo test               # 运行测试
-cargo install --path .   # 安装到本地
+cargo install --path .   # 安装到本地 PATH
 ```
+
+### 云端构建（HTTP API Server）
+
+云端构建开启 `--features server`，额外编译 axum HTTP Server，新增 `numina serve` 子命令：
+
+```bash
+# 本地验证云端构建
+cargo build --release --features server
+
+# 直接运行云端服务
+cargo run --release --features server -- serve --port 14521
+```
+
+### Docker 构建（推荐云端部署方式）
+
+```bash
+# 构建镜像（内部自动使用 --features server）
+docker build -t numina-server .
+
+# 运行（飞书 Channel 自动处理 + HTTP API）
+docker run -d \
+  -p 14521:14521 \
+  -e LARK_APP_ID=cli_xxxxxxxxxxxxxxxx \
+  -e LARK_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  -e ANTHROPIC_API_KEY=sk-ant-xxx \
+  -e NUMINA_API_TOKEN=your-secret-token \
+  -v numina-data:/home/numina \
+  numina-server
+
+# 只开 HTTP API，不启飞书 channel
+docker run -d -p 14521:14521 \
+  -e ANTHROPIC_API_KEY=sk-ant-xxx \
+  numina-server serve --no-lark
+```
+
+---
+
+## 云端自动部署
+
+### 工作原理
+
+```
+本地 git push → GitHub Actions 自动构建镜像 → 推送到 GHCR
+云端服务器：docker compose pull && docker compose up -d
+```
+
+**飞书认证说明：**
+- 云端 channel 使用**机器人（bot）身份**，只需 App ID + App Secret
+- 容器启动时自动执行 `lark-cli config init`，**无需浏览器、无需 user auth**
+- 凭证通过环境变量注入，安全且可重复部署
+
+### 第一步：配置环境变量
+
+```bash
+# 在云端服务器上
+cp .env.server .env
+vim .env   # 填写真实值
+```
+
+`.env` 文件内容：
+
+```bash
+# 飞书机器人凭证（在 https://open.feishu.cn/app 创建自建应用获取）
+LARK_APP_ID=cli_xxxxxxxxxxxxxxxx
+LARK_APP_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# AI 模型（至少填一个）
+ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxx
+
+# Numina 鉴权 Token（建议设置）
+NUMINA_API_TOKEN=your-secret-token-here
+```
+
+### 第二步：启动服务
+
+```bash
+# 拉取最新镜像并启动
+docker compose up -d
+
+# 查看启动日志（确认飞书 channel 已连接）
+docker compose logs -f
+
+# 检查健康状态
+curl http://localhost:14521/health
+```
+
+启动日志示例：
+
+```
+╔══════════════════════════════════════════════════╗
+║         Numina Cloud Server — 启动中             ║
+╚══════════════════════════════════════════════════╝
+
+🔧 [1/2] 初始化 lark-cli 配置...
+   App ID: cli_xxxxxxxxxxxxxxxx
+   Brand : feishu
+   ✅ lark-cli 配置完成
+
+🚀 [2/2] 启动 Numina Server...
+
+╔══════════════════════════════════════════════════╗
+║        Numina Server v0.1.0                      ║
+╠══════════════════════════════════════════════════╣
+║  监听  : http://0.0.0.0:14521                    ║
+║  飞书  : 启动中 (React)                          ║
+╚══════════════════════════════════════════════════╝
+```
+
+### 第三步：配置 GitHub Actions 自动部署
+
+推送代码到 `main` 分支后，GitHub Actions 自动构建并推送镜像到 GHCR：
+
+```bash
+git push origin main   # 触发自动构建
+```
+
+云端服务器更新：
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+> 💡 **提示**：可在云端服务器配置 Watchtower 实现镜像自动更新：
+> ```bash
+> docker run -d --name watchtower \
+>   -v /var/run/docker.sock:/var/run/docker.sock \
+>   containrrr/watchtower numina-server --interval 300
+> ```
+
+### 云端 API 说明
+
+| 端点 | 方法 | 说明 | 鉴权 |
+|------|------|------|------|
+| `/health` | GET | 健康检查（k8s/docker 探针） | 无需 |
+| `/api/v1/status` | GET | 服务状态（模型、channel 等） | Bearer |
+| `/api/v1/chat` | POST | 普通对话，返回完整 JSON | Bearer |
+| `/api/v1/chat/stream` | POST | 流式对话，SSE 格式 | Bearer |
+| `/api/v1/channel/status` | GET | 飞书 channel 运行状态 | Bearer |
+
+**普通对话请求示例：**
+
+```bash
+curl -X POST http://localhost:14521/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secret-token" \
+  -d '{"message": "帮我写一个 Rust hello world", "session_id": "可选"}'
+```
+
+**SSE 流式对话请求示例：**
+
+```bash
+curl -N -X POST http://localhost:14521/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-secret-token" \
+  -d '{"message": "帮我写一个 Rust hello world"}'
+
+# SSE 事件格式：
+# event: delta  data: {"text":"..."}                      ← 流式文本片段
+# event: done   data: {"session_id":"...","model":"..."}  ← 完成
+# event: error  data: {"error":"..."}                     ← 错误
+```
+
+**云端环境变量：**
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `LARK_APP_ID` | 飞书 App ID（启用飞书 channel 必填） | — |
+| `LARK_APP_SECRET` | 飞书 App Secret（启用飞书 channel 必填） | — |
+| `LARK_BRAND` | feishu 或 lark（国际版） | `feishu` |
+| `NUMINA_HOST` | 监听地址 | `0.0.0.0` |
+| `NUMINA_PORT` | 监听端口 | `14521` |
+| `NUMINA_API_TOKEN` | Bearer token 鉴权 | 不鉴权 |
+| `ANTHROPIC_API_KEY` | Anthropic API Key | — |
+| `OPENAI_API_KEY` | OpenAI API Key | — |
+| `RUST_LOG` | 日志级别 | `numina=info` |
 
 ---
 
@@ -482,6 +661,7 @@ src/
 │   ├── mcp.rs        # MCP 工具
 │   ├── collaborate.rs # 协作功能
 │   ├── auth.rs       # 飞书 OAuth 登录
+│   ├── serve.rs      # 云端 HTTP Server（仅 --features server，本地不编译）
 │   └── session/      # 交互式会话（readline / renderer / completer）
 ├── core/             # 核心功能
 │   ├── agent/        # Agent 实现（base / executor / memory）

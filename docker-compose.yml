@@ -1,0 +1,65 @@
+# =============================================================================
+# Numina Cloud Server — docker-compose.yml
+#
+# 快速启动：
+#   cp .env.server .env          # 复制并填写环境变量
+#   docker compose up -d         # 后台启动
+#   docker compose logs -f       # 查看日志
+#   docker compose down          # 停止
+#
+# 更新到最新镜像：
+#   docker compose pull && docker compose up -d
+# =============================================================================
+
+services:
+  numina:
+    image: ghcr.io/td-middleware/numina:latest
+    # 本地构建（开发调试用）：
+    # build: .
+    container_name: numina-server
+    restart: unless-stopped
+
+    ports:
+      - "${NUMINA_PORT:-14521}:14521"
+
+    environment:
+      # ── 飞书机器人凭证（bot 身份，无需浏览器授权）────────────────────────
+      # 在飞书开放平台创建应用后获取：https://open.feishu.cn/app
+      LARK_APP_ID: "${LARK_APP_ID}"
+      LARK_APP_SECRET: "${LARK_APP_SECRET}"
+      LARK_BRAND: "${LARK_BRAND:-feishu}"
+
+      # ── AI 模型 API Key（至少填一个）────────────────────────────────────
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
+      # ── Numina Server 配置 ───────────────────────────────────────────────
+      NUMINA_HOST: "0.0.0.0"
+      NUMINA_PORT: "14521"
+      NUMINA_API_TOKEN: "${NUMINA_API_TOKEN:-}"
+
+      # ── 日志 ────────────────────────────────────────────────────────────
+      RUST_LOG: "${RUST_LOG:-numina=info}"
+      TZ: "${TZ:-Asia/Shanghai}"
+
+    volumes:
+      # 持久化数据：lark-cli 配置 + numina 配置 + 记忆数据库
+      # 重启容器后无需重新配置 lark-cli
+      - numina-data:/home/numina
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:14521/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  numina-data:
+    driver: local

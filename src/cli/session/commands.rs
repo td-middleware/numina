@@ -1575,7 +1575,12 @@ pub fn lark_avatar_circle_path() -> Option<std::path::PathBuf> {
 // 飞书登录过期检测
 // ─────────────────────────────────────────────
 
-/// 检查飞书登录是否已过期（超过 8 小时未重新登录）
+/// 检查飞书登录是否已过期
+///
+/// 优先使用 token 文件中的 `expires_in` 字段精确判断：
+///   - 文件修改时间 + expires_in 秒 < 当前时间 → 已过期
+/// 兜底：如果无法解析 expires_in，则用文件修改时间超过 8 小时判断
+///
 /// 返回 Some(hours) 表示已过期多少小时，None 表示未登录或未过期
 pub fn check_lark_login_expiry() -> Option<u64> {
     let token_path = dirs::home_dir()?.join(".numina").join("cache").join("lark_token.json");
@@ -1585,7 +1590,30 @@ pub fn check_lark_login_expiry() -> Option<u64> {
     let meta = std::fs::metadata(&token_path).ok()?;
     let modified = meta.modified().ok()?;
     let elapsed = modified.elapsed().ok()?;
-    let hours = elapsed.as_secs() / 3600;
+    let elapsed_secs = elapsed.as_secs();
+
+    // 尝试读取 token 文件中的 expires_in 字段
+    if let Ok(content) = std::fs::read_to_string(&token_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(expires_in) = json.get("expires_in").and_then(|v| v.as_i64()) {
+                if expires_in > 0 {
+                    let expires_in_u = expires_in as u64;
+                    if elapsed_secs >= expires_in_u {
+                        // 已过期：计算超过了多少小时
+                        let overdue_secs = elapsed_secs.saturating_sub(expires_in_u);
+                        let overdue_hours = overdue_secs / 3600;
+                        // 至少显示 1 小时（避免显示 0 小时）
+                        return Some(overdue_hours.max(1));
+                    } else {
+                        return None; // 未过期
+                    }
+                }
+            }
+        }
+    }
+
+    // 兜底：文件修改时间超过 8 小时
+    let hours = elapsed_secs / 3600;
     if hours >= 8 {
         Some(hours)
     } else {

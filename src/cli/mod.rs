@@ -12,6 +12,10 @@ pub mod config;
 pub mod channel;
 pub mod auth;
 
+// 仅云端构建（--features server）时编译
+#[cfg(feature = "server")]
+pub mod serve;
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Start interactive chat with Numina agent
@@ -43,6 +47,10 @@ pub enum Commands {
 
     /// Show Numina status and diagnostics
     Status,
+
+    /// Start HTTP API server for cloud deployment (requires --features server)
+    #[cfg(feature = "server")]
+    Serve(serve::ServeArgs),
 }
 
 impl Commands {
@@ -57,6 +65,8 @@ impl Commands {
             Commands::Config(args) => config::execute(args).await,
             Commands::Channel(args) => channel::execute(args).await,
             Commands::Auth(args) => auth::execute(args).await,
+            #[cfg(feature = "server")]
+            Commands::Serve(args) => serve::execute(args).await,
             Commands::Status => {
                 let models = crate::config::ModelsConfig::load().unwrap_or_default();
                 let mcp = crate::config::McpFileConfig::load().unwrap_or_default();

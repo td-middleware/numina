@@ -71,6 +71,97 @@ impl ReactHandler {
     }
 }
 
+// ─────────────────────────────────────────────
+// 终端彩色打印辅助
+// ─────────────────────────────────────────────
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BLUE: &str = "\x1b[34m";
+const GRAY: &str = "\x1b[38;5;244m";
+
+/// 打印收到消息的日志（带时间戳和彩色格式）
+fn print_incoming(msg: &IncomingMessage) {
+    use std::io::Write;
+    let now = chrono::Local::now().format("%H:%M:%S");
+    let chat_label = if msg.is_direct {
+        format!("{}私聊{}", CYAN, RESET)
+    } else {
+        format!("{}群聊@{}", BLUE, RESET)
+    };
+    let sender = if msg.sender_id.len() > 12 {
+        format!("{}…{}", &msg.sender_id[..8], &msg.sender_id[msg.sender_id.len()-4..])
+    } else {
+        msg.sender_id.clone()
+    };
+    // 内容预览（最多 80 字符）
+    let preview: String = msg.content.chars().take(80).collect();
+    let ellipsis = if msg.content.chars().count() > 80 { "…" } else { "" };
+
+    println!();
+    println!("  {}┌─ 📨 收到消息 ─────────────────────────────────────{}", CYAN, RESET);
+    println!("  {}│{} {}时间{} {}  {}来源{} {}  {}发送者{} {}{}{}",
+        CYAN, RESET,
+        DIM, RESET, now,
+        DIM, RESET, chat_label,
+        DIM, RESET, GRAY, sender, RESET);
+    println!("  {}│{}", CYAN, RESET);
+    println!("  {}│{} {}{}{}{}", CYAN, RESET, BOLD, preview, ellipsis, RESET);
+    println!("  {}└────────────────────────────────────────────────────{}", CYAN, RESET);
+    println!();
+    std::io::stdout().flush().ok();
+}
+
+/// 打印 AI 正在处理的状态
+fn print_processing(content: &str) {
+    use std::io::Write;
+    let preview: String = content.chars().take(60).collect();
+    let ellipsis = if content.chars().count() > 60 { "…" } else { "" };
+    println!("  {}⏳ AI 处理中：{}{}{}{}", DIM, RESET, preview, ellipsis, RESET);
+    std::io::stdout().flush().ok();
+}
+
+/// 打印工具调用信息
+fn print_tool_call(tool_name: &str, params: &str) {
+    use std::io::Write;
+    let preview: String = params.chars().take(60).collect();
+    let ellipsis = if params.chars().count() > 60 { "…" } else { "" };
+    println!("  {}  ● {}{}{} {}{}{}{}{}",
+        CYAN, RESET, BOLD, tool_name, RESET, DIM, preview, ellipsis, RESET);
+    std::io::stdout().flush().ok();
+}
+
+/// 打印回复成功
+fn print_reply_sent(response: &str) {
+    use std::io::Write;
+    let now = chrono::Local::now().format("%H:%M:%S");
+    let preview: String = response.chars().take(80).collect();
+    let ellipsis = if response.chars().count() > 80 { "…" } else { "" };
+    println!();
+    println!("  {}┌─ ✅ 已回复 ────────────────────────────────────────{}", GREEN, RESET);
+    println!("  {}│{} {}时间{} {}  {}长度{} {} 字符",
+        GREEN, RESET,
+        DIM, RESET, now,
+        DIM, RESET, response.len());
+    println!("  {}│{}", GREEN, RESET);
+    println!("  {}│{} {}{}{}{}", GREEN, RESET, DIM, preview, ellipsis, RESET);
+    println!("  {}└────────────────────────────────────────────────────{}", GREEN, RESET);
+    println!();
+    std::io::stdout().flush().ok();
+}
+
+/// 打印错误
+fn print_error(msg: &str) {
+    use std::io::Write;
+    println!("  {}❌ 处理失败：{}{}", YELLOW, msg, RESET);
+    println!();
+    std::io::stdout().flush().ok();
+}
+
 #[async_trait::async_trait]
 impl MessageHandler for ReactHandler {
     async fn handle_message(&self, msg: IncomingMessage) -> anyhow::Result<()> {
@@ -82,7 +173,19 @@ impl MessageHandler for ReactHandler {
             "ReactHandler: processing message"
         );
 
+        // ── 终端打印：收到消息 ──
+        print_incoming(&msg);
+
         let message_id = msg.extra.get("message_id").cloned().unwrap_or_default();
+
+        // ── 需求1：立即给消息打 "Get"（[了解]）表情，表示已收到 ──
+        // 异步执行，不阻塞后续处理流程
+        if !message_id.is_empty() && msg.source == MessageSource::Lark {
+            let mid = message_id.clone();
+            tokio::spawn(async move {
+                react_lark_message(&mid, "Get").await;
+            });
+        }
 
         // ── 第一步：检查是否是意图选择回复 ──
         // 如果当前会话有待确认的意图选择，优先处理
@@ -91,6 +194,7 @@ impl MessageHandler for ReactHandler {
                 let consumed = clarifier.handle_reply(&msg.content, &message_id).await;
                 if consumed {
                     info!("ReactHandler: message consumed as intent choice reply");
+                    println!("  {}→ 已处理为意图选择回复{}", DIM, RESET);
                     return Ok(());
                 }
             }
@@ -109,6 +213,7 @@ impl MessageHandler for ReactHandler {
                 Ok(None) => {
                     // 用户取消或超时
                     info!("ReactHandler: user cancelled intent selection");
+                    println!("  {}→ 用户取消意图选择{}", DIM, RESET);
                     return Ok(());
                 }
                 Err(e) => {
@@ -130,30 +235,63 @@ impl MessageHandler for ReactHandler {
             refined_prompt
         );
 
-        match self.engine.chat_react(&user_input, None, None).await {
+        // 打印处理状态
+        print_processing(&refined_prompt);
+
+        // ── 需求2：飞书 channel 使用 chat_react_auto（自动批准所有工具，无需用户确认）
+        // 每步操作通过 tracing::info! 记录日志，便于问题定位
+        match self.engine.chat_react_auto(&user_input, None, None).await {
             Ok((mut rx, _perm_tx, _sid, _sent, _ctx)) => {
                 let mut full_response = String::new();
+                let mut step = 0usize;
                 while let Some(event) = rx.recv().await {
                     if event == "\x00D" {
                         break;
                     } else if let Some(text) = event.strip_prefix("\x00C") {
                         full_response.push_str(text);
+                    } else if let Some(tool_info) = event.strip_prefix("\x00T") {
+                        // 打印工具调用 + 记录日志
+                        step += 1;
+                        let parts: Vec<&str> = tool_info.splitn(2, '|').collect();
+                        let tool_name = parts.first().copied().unwrap_or("?");
+                        let params = parts.get(1).copied().unwrap_or("");
+                        print_tool_call(tool_name, params);
+                        info!(
+                            step = step,
+                            tool = tool_name,
+                            params = params,
+                            "channel: tool executed (auto-approved)"
+                        );
+                    } else if let Some(summary) = event.strip_prefix("\x00S") {
+                        // 打印工具摘要 + 记录日志
+                        println!("  {}  ⏺ {}{}", DIM, summary, RESET);
+                        info!(summary = summary, "channel: agent step summary");
+                    } else if let Some(result) = event.strip_prefix("\x00R") {
+                        // 记录工具结果日志（不打印到终端，避免刷屏）
+                        let preview: String = result.chars().take(200).collect();
+                        info!(result_preview = %preview, "channel: tool result received");
                     }
-                    // 工具调用等事件在 channel 模式下静默处理
+                    // 其他事件静默处理
                 }
 
                 if !full_response.is_empty() {
                     info!(
                         response_len = full_response.len(),
+                        total_steps = step,
                         "ReactHandler: got response, sending reply"
                     );
+                    // 打印回复内容
+                    print_reply_sent(&full_response);
                     if !message_id.is_empty() {
                         reply_lark_message(&message_id, &full_response).await;
                     }
+                } else {
+                    println!("  {}→ AI 无回复内容{}", DIM, RESET);
                 }
             }
             Err(e) => {
-                error!("ReactHandler: chat_react failed: {}", e);
+                error!("ReactHandler: chat_react_auto failed: {}", e);
+                print_error(&e.to_string());
                 if !message_id.is_empty() {
                     reply_lark_message(&message_id, &format!("❌ 处理失败：{}", e)).await;
                 }
@@ -161,6 +299,49 @@ impl MessageHandler for ReactHandler {
         }
 
         Ok(())
+    }
+}
+
+/// 通过 lark-cli 给飞书消息打表情（表示"已收到/Get"）
+/// emoji_type: 飞书表情类型，如 "EYES"（👀）、"OK"（👌）、"THUMBSUP"（👍）
+///
+/// 正确命令格式：
+///   lark-cli im reactions create \
+///     --params '{"message_id": "om_xxx"}' \
+///     --data '{"reaction_type": {"emoji_type": "EYES"}}' \
+///     --as bot
+async fn react_lark_message(message_id: &str, emoji_type: &str) {
+    let params = serde_json::json!({"message_id": message_id}).to_string();
+    let data = serde_json::json!({"reaction_type": {"emoji_type": emoji_type}}).to_string();
+
+    let output = tokio::process::Command::new("lark-cli")
+        .args([
+            "im",
+            "reactions",
+            "create",
+            "--params",
+            &params,
+            "--data",
+            &data,
+            "--as",
+            "bot",
+        ])
+        .output()
+        .await;
+
+    match output {
+        Ok(out) if out.status.success() => {
+            info!("reaction '{}' added to message {}", emoji_type, message_id);
+        }
+        Ok(out) => {
+            warn!(
+                "lark-cli react failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Err(e) => {
+            warn!("lark-cli not available for react: {}", e);
+        }
     }
 }
 
