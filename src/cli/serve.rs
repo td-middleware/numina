@@ -215,7 +215,7 @@ pub mod inner {
         State(state): State<AppState>,
         headers: HeaderMap,
         Json(req): Json<ChatRequest>,
-    ) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    ) -> Sse<std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event, std::convert::Infallible>> + Send>>> {
         // 鉴权失败：返回单个 error 事件
         if !check_auth(&headers, &state.api_token) {
             let stream = async_stream::stream! {
@@ -223,7 +223,7 @@ pub mod inner {
                     Event::default().event("error").data(r#"{"error":"Unauthorized"}"#)
                 );
             };
-            return Sse::new(stream);
+            return Sse::new(Box::pin(stream));
         }
 
         let engine = state.engine.clone();
@@ -269,7 +269,7 @@ pub mod inner {
             }
         };
 
-        Sse::new(stream)
+        Sse::new(Box::pin(stream))
     }
 
     /// GET /api/v1/channel/status — 飞书 channel 状态
